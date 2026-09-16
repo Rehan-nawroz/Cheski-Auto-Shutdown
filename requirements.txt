@@ -1,0 +1,3 @@
+# Runtime dependency.  pygetwindow uses ctypes on Windows, so pywin32 is NOT
+# required (verified against pygetwindow 0.0.9).
+pygetwindow==0.0.9
