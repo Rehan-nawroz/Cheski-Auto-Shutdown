@@ -15,6 +15,7 @@ this way, how it is put together, how it was built, and what comes next.
 
 * **Version:** 1.0.0
 * **Milestones M0–M5:** complete
+* **Delivery:** committed locally as `54dc0fd` on `master` (single-commit history). No remote is configured; there is no push, PR or CI by design. The only unproven behavior is the M6 supervised live power-off ([04 — Test plan](04-TEST-PLAN.md) §8).
 * **Test suite:** 139 tests, all passing (`python -m pytest`)
 * **Playtest:** driven through the real GUI (clicks, keystrokes, real second process); its findings and fixes are in [04 — Test plan](04-TEST-PLAN.md#10-gui-playtest-and-what-it-found)
 * **Platform:** Windows, Python 3.11+ (developed against 3.12.10)
