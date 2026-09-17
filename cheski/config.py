@@ -22,7 +22,21 @@ log = logging.getLogger("cheski.config")
 
 APP_NAME = "CheskiAutoShutdown"
 
-DEFAULT_TRIGGERS: tuple[str, ...] = ("100%", "complete", "finished")
+#: Words downloaders put in their title bars when a download completes.
+#: Matching is a case-insensitive substring test, so "complete" already covers
+#: "completed"/"Download complete", and "100%" covers numeric progress.
+SUGGESTED_TRIGGERS: tuple[str, ...] = (
+    "100%",        # numeric progress (Steam, browsers, torrents)
+    "complete",    # IDM says "Download complete"; also matches "completed"
+    "finished",
+    "done",
+    "downloaded",
+    "seeding",     # torrents that reach 100% and start seeding
+)
+
+#: Fresh installs start with every suggested word armed; the GUI also offers
+#: them as one-click additions for installs saved with an older, narrower set.
+DEFAULT_TRIGGERS: tuple[str, ...] = SUGGESTED_TRIGGERS
 
 #: Allowed ranges, shared with the GUI spinboxes and the power layer so a
 #: hand-edited config file can never ask for something absurd.

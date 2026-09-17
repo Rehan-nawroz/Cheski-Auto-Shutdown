@@ -34,6 +34,7 @@ from ..config import (
     DELAY_RANGE,
     DWELL_RANGE,
     INTERVAL_RANGE,
+    SUGGESTED_TRIGGERS,
     Settings,
     clamp,
     config_path,
@@ -78,6 +79,7 @@ from .widgets import (
     StatusRing,
     TagChipField,
     TerminalLog,
+    TriggerSuggestions,
     toast,
 )
 
@@ -180,6 +182,10 @@ class CheskiApp:
                                              on_change=self._on_transition_changed,
                                              tooltip="Only fire after the trigger clears once (recommended)")
         self.transition_toggle.pack(side="left", padx=(8, 0))
+        self.suggestions = TriggerSuggestions(
+            left, suggestions=SUGGESTED_TRIGGERS, on_add=self._add_suggested_trigger
+        )
+        self.suggestions.pack(fill="x")
         self.chips.set_tags(self.settings.triggers)
 
         # -- left: timing cards ------------------------------------------
@@ -297,7 +303,13 @@ class CheskiApp:
         return bool(self.dry_banner.value)
 
     def _on_triggers_changed(self) -> None:
+        if hasattr(self, "suggestions"):
+            self.suggestions.refresh(self.chips.tags())
         self._save_preferences_only()
+
+    def _add_suggested_trigger(self, word: str) -> None:
+        """One click on a suggested word arms it like typed input."""
+        self.chips.set_tags([*self.chips.tags(), word])
 
     def _on_match_mode_changed(self, value: str) -> None:
         self.settings.match_mode = value

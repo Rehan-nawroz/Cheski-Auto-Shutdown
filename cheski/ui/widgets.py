@@ -993,3 +993,69 @@ def toast(master, message: str, *, kind: str = "info", duration_ms=1800) -> None
     pill.place(relx=0.5, rely=1.0, anchor="s", y=-18)
     pill.lift()
     master.after(duration_ms, pill.destroy)
+
+
+# ---------------------------------------------------------------------------
+# Trigger suggestions
+# ---------------------------------------------------------------------------
+
+
+class TriggerSuggestions(tk.Frame):
+    """One-click vocabulary of common completion words.
+
+    Renders one small pill per suggested word, hiding the ones already present
+    in the chip field, so the user can arm a sane trigger set without typing.
+    A click calls ``on_add(word)``; the owner decides what adding means and
+    calls :meth:`refresh` with the current tags afterwards.
+    """
+
+    PAD = 6
+
+    def __init__(self, master, *, suggestions, on_add):
+        super().__init__(master, bg=theme.SURFACE, bd=0, highlightthickness=0)
+        self.suggestions = tuple(suggestions)
+        self.on_add = on_add
+        self._present: frozenset[str] = frozenset()
+        self._pills: list[tk.Label] = []
+        self._hint = tk.Label(
+            self, text="suggested:", bg=theme.SURFACE, fg=theme.TEXT_MUTED,
+            font=theme.font("label_caps"),
+        )
+        self._hint.pack(side="left", padx=(0, self.PAD))
+        self._flow = tk.Frame(self, bg=theme.SURFACE)
+        self._flow.pack(side="left", fill="x", expand=True)
+
+    # -- public API -------------------------------------------------------
+
+    def offered(self) -> tuple[str, ...]:
+        """The suggested words not already present (case-insensitive)."""
+        present = {word.casefold() for word in self._present}
+        return tuple(word for word in self.suggestions if word.casefold() not in present)
+
+    def refresh(self, current_tags) -> None:
+        """Re-show the row for the given chip-field contents."""
+        self._present = frozenset(str(tag) for tag in current_tags)
+        for pill in self._pills:
+            pill.destroy()
+        self._pills = []
+        for word in self.offered():
+            pill = tk.Label(
+                self._flow, text=f"+ {word}", cursor="hand2",
+                bg="#0f1219", fg=theme.TEXT_SECONDARY,
+                font=_mono(9), padx=8, pady=2,
+                highlightthickness=1, highlightbackground=theme.BORDER,
+            )
+            pill.pack(side="left", padx=(0, 4), pady=1)
+            pill.bind("<Button-1>", lambda _e, w=word: self.on_add(w))
+            pill.bind(
+                "<Enter>",
+                lambda e, p=pill: p.configure(fg=theme.PRIMARY, highlightbackground=theme.BORDER_FOCUS),
+            )
+            pill.bind(
+                "<Leave>",
+                lambda e, p=pill: p.configure(fg=theme.TEXT_SECONDARY, highlightbackground=theme.BORDER),
+            )
+            self._pills.append(pill)
+        self._hint.configure(
+            text="all words added ✓" if not self.offered() else "suggested:",
+        )
