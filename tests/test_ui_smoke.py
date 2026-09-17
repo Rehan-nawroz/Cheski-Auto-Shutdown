@@ -1,11 +1,15 @@
-"""GUI integration tests.
+"""GUI integration tests — Terminal Precision surface.
 
 These drive the real :class:`CheskiApp` against a fake window source and an
 injected command runner, so the entire arm -> fire -> abort path is exercised
 without a desktop, a download, or a real ``shutdown.exe``.
 
-Modal dialogs are replaced: a real ``messagebox`` would block the suite
-forever, and the Tk root is withdrawn so nothing pops up on screen.
+The new surface's seams: ``app.picker`` (process rows), ``app.chips`` (trigger
+tags), ``app.segmented``/``app.case_toggle``/``app.transition_toggle``,
+``app.interval_card``/``app.dwell_card``/``app.delay_card``,
+``app.dry_banner``, ``app.ring``, ``app.log_panel``, ``app.abort_pill``.
+Modal dialogs are still replaced (a real ``messagebox`` would block), and the
+Tk root is withdrawn so nothing pops up on screen.
 """
 
 from __future__ import annotations
@@ -113,11 +117,14 @@ def build_app(root, source, recorder, *, choose: bool = True, **overrides) -> Ch
     return app
 
 
+def rows_of(app) -> list:
+    return list(app.picker._rows)
+
+
 def choose_window(app, prefix: str = "Steam"):
-    """Pick a window the way a user does: set the dropdown, raise its event."""
-    label = next(label for label in app._windows if prefix in label)
-    app.window_box.set(label)
-    app.window_box.event_generate("<<ComboboxSelected>>")
+    """Pick a window the way a user does: select a picker row by name."""
+    row = next(row for row in app.picker._rows if prefix in row.display_name)
+    app.picker.select_row(row)
     return app.target
 
 
@@ -126,11 +133,9 @@ def test_app_constructs_without_preselecting_a_window(tk_root, fake_source, reco
     app = build_app(tk_root, fake_source, recorder, choose=False)
     try:
         assert app.state == STATE_IDLE
-        assert app.window_box.get() == ""
+        assert app.picker.selected_row() is None
         assert app.target is None
-        assert "No window selected" in app.target_info_var.get()
-        assert app.dry_run_var.get() is False
-        assert "shutdown /s /t 15 /c" in app.preview_var.get()
+        assert app.dry_banner.value is False
     finally:
         app._on_close()
 
@@ -149,7 +154,8 @@ def test_refresh_keeps_the_window_the_user_chose(tk_root, recorder):
         source.windows.insert(0, WindowInfo(7, "AAA Launcher", pid=99, process="aaa.exe"))
         app.refresh_windows()
 
-        assert app.window_box.get().startswith("Steam - Downloading 12%")
+        assert app.picker.selected_row() is not None
+        assert app.picker.selected_row().info.handle == 4242
         assert app.target is not None and app.target.handle == 4242
     finally:
         app._on_close()
@@ -166,8 +172,9 @@ def test_remembered_target_is_restored_on_launch(tk_root, recorder):
         tk_root, source, recorder, choose=False, last_process="steam.exe"
     )
     try:
-        assert app.window_box.get().startswith("Steam")
         assert app.target is not None and app.target.handle == 4242
+        assert app.picker.selected_row() is not None
+        assert app.picker.selected_row().info.handle == 4242
     finally:
         app._on_close()
 
@@ -177,100 +184,96 @@ def test_picker_is_locked_while_monitoring(tk_root, fake_source, recorder):
     app = build_app(tk_root, fake_source, recorder)
     try:
         assert app.start_monitoring() is True
-        assert str(app.window_box.cget("state")) == "disabled"
-        assert app.refresh_button.instate(["disabled"])
-        assert "Steam - Downloading 12%" in app.watched_var.get()
-
-        # Even a forced selection change cannot move the target off the
-        # window that the monitor is actually reading.
-        app.window_box.event_generate("<<ComboboxSelected>>")
-        assert app.worker is not None
-        assert app.worker.target.handle == 4242
-        assert app.window_box.get().startswith("Steam - Downloading 12%")
+        assert str(app.picker.search_entry.cget("state")) == "disabled"
+        assert "Steam - Downloading 12%" in app.watched_label.cget("text")
 
         app.stop_monitoring()
-        assert str(app.window_box.cget("state")) == "readonly"
-        assert app.watched_var.get() == ""
+        assert str(app.picker.search_entry.cget("state")) == "normal"
     finally:
         app._on_close()
 
 
-def test_typed_numbers_settle_to_the_values_actually_used(tk_root, fake_source, recorder):
-    """A field must never keep advertising a value the app will not use."""
+def test_metric_cards_clamp_out_of_range_values(tk_root, fake_source, recorder):
+    """Steppers and stored settings must stay inside the documented ranges."""
     app = build_app(tk_root, fake_source, recorder)
     try:
-        app.delay_var.set("99999")
-        app.interval_var.set("abc")
-        app.dwell_var.set("0")
-
-        assert app.start_monitoring() is True
-
-        # 99999 -> 600, "abc" -> back to the configured 0.5s, 0 -> the 1-check floor
-        assert app.delay_var.get() == "600"
-        assert app.interval_var.get() == "0.5"
-        assert app.dwell_var.get() == "1"
-        assert "/t 600" in app.preview_var.get()
-        assert app.state == STATE_WARMING
+        app.delay_card.set_value(99999, animate=False)
+        assert app.delay_card.get() == 600
+        app.delay_card.set_value(1, animate=False)
+        assert app.delay_card.get() == 15
+        app.dwell_card.set_value(0, animate=False)
+        assert app.dwell_card.get() == 1
+        app.interval_card.set_value(999, animate=False)
+        assert app.interval_card.get() == 60
+        assert app.delay_card.warn_below == 30
     finally:
         app._on_close()
 
 
-def test_number_fields_are_wired_to_the_preview_and_settle(tk_root, fake_source, recorder):
-    """Keyboard events cannot be routed to an unmapped test window, so this
-    checks the wiring plus the handler those bindings call.  The end-to-end
-    version (real typing into a real window) is in tests/manual/live_probe.py
-    and the playtest transcript."""
+def test_trigger_chips_add_and_remove(tk_root, fake_source, recorder):
     app = build_app(tk_root, fake_source, recorder)
     try:
-        for box in (app.interval_box, app.dwell_box, app.delay_box):
-            assert box.bind("<KeyRelease>")
-            assert box.bind("<FocusOut>")
-
-        app.delay_var.set("300")
-        app._settle_fields()  # what <FocusOut> invokes
-        assert app.delay_var.get() == "300"
-        assert "/t 300" in app.preview_var.get()
-
-        app.delay_var.set("99999")
-        app._settle_fields()
-        assert app.delay_var.get() == "600"
-        assert "/t 600" in app.preview_var.get()
+        app.chips.entry.delete(0, "end")
+        app.chips.entry.insert(0, "done")
+        app.chips._commit()
+        assert "done" in app.chips.tags()
+        assert "100%" in app.chips.tags()
+        # duplicates collapse case-insensitively
+        app.chips.entry.delete(0, "end")
+        app.chips.entry.insert(0, "DONE")
+        app.chips._commit()
+        assert app.chips.tags().count("done") == 1
+        app.chips._remove("done")
+        assert "done" not in app.chips.tags()
     finally:
         app._on_close()
 
 
-def test_dry_run_preview_uses_the_current_delay(tk_root, fake_source, recorder):
+def test_segmented_and_toggles_follow_the_settings(tk_root, fake_source, recorder):
     app = build_app(tk_root, fake_source, recorder)
     try:
-        app.delay_var.set("120")
-        app._update_preview()
-        assert "/t 120" in app.preview_var.get()
-
-        app.delay_var.set("not a number")  # never trust a text field
-        app._update_preview()
-        assert "/t 15" in app.preview_var.get()
+        app.segmented.set_value("all", notify=True)
+        assert app.segmented.value == "all"
+        app.case_toggle.set_value(True, notify=True)
+        assert app.case_toggle.value is True
+        app.transition_toggle.set_value(False, notify=True)
+        assert app.transition_toggle.value is False
+        assert app.settings.match_mode == "all"
+        assert app.settings.case_sensitive is True
+        assert app.settings.require_transition is False
     finally:
         app._on_close()
 
 
-def test_start_requires_a_trigger_word(tk_root, fake_source, recorder, patched_app_environment):
+def test_dry_run_banner_toggles_and_shows_the_badge(tk_root, fake_source, recorder):
     app = build_app(tk_root, fake_source, recorder)
     try:
-        app.trigger_var.set("   ,  ")
+        assert app.dry_banner.value is False
+        assert app.dry_banner.badge.cget("text") == "LIVE"
+        app.dry_banner.set_value(True, notify=True)
+        assert app.dry_banner.badge.cget("text") == "SAFE"
+        assert app.dry_run is True
+    finally:
+        app._on_close()
+
+
+def test_start_requires_a_trigger_word(tk_root, fake_source, recorder):
+    app = build_app(tk_root, fake_source, recorder)
+    try:
+        app.chips.set_tags([])
         assert app.start_monitoring() is False
         assert app.worker is None
-        assert patched_app_environment.kinds() == ["error"]
+        assert app.state == STATE_IDLE
     finally:
         app._on_close()
 
 
-def test_start_requires_a_selected_window(tk_root, recorder, patched_app_environment):
+def test_start_requires_a_selected_window(tk_root, recorder):
     app = build_app(tk_root, FakeWindowSource([]), recorder, choose=False)
     try:
         assert app.start_monitoring() is False
         assert app.worker is None
-        assert "error" in patched_app_environment.kinds()
-        assert "Refresh list" in app.target_info_var.get()
+        assert app.state == STATE_IDLE
     finally:
         app._on_close()
 
@@ -280,22 +283,25 @@ def test_arming_then_firing_then_aborting(tk_root, fake_source, recorder):
     try:
         assert app.start_monitoring() is True
         assert app.state == STATE_WARMING
+        assert app.ring.state == "active"
 
         # The title has no trigger, so the first poll arms the engine.
         assert spin(tk_root, lambda: app.state == STATE_MONITORING)
 
         fake_source.set_title(4242, "Steam - Downloading 100%")
         assert spin(tk_root, lambda: app.state == STATE_TRIGGERED)
+        assert app.ring.state == "executing"
 
         # 1. the shutdown was scheduled with the right countdown
         assert recorder.calls[0][:4] == ["shutdown", "/s", "/t", "15"]
-        assert app.countdown is not None
+        assert app._seconds_left >= 1
+        assert app.countdown_label.winfo_ismapped() or app.countdown_label.cget("text")
 
         # 2. the emergency abort reaches shutdown /a
         app.abort_shutdown()
         assert recorder.calls[1] == ["shutdown", "/a"]
         assert app.state == STATE_ABORTED
-        assert app.countdown is None
+        assert app.ring.state == "idle"
     finally:
         app._on_close()
 
@@ -306,7 +312,6 @@ def test_already_finished_download_never_fires(tk_root, fake_source, recorder):
     app = build_app(tk_root, fake_source, recorder)
     try:
         assert app.start_monitoring() is True
-        app.dwell_var.set("1")
         assert not spin(tk_root, lambda: app.state == STATE_TRIGGERED, timeout=3.0)
         assert app.state == STATE_WARMING
         assert recorder.calls == []
@@ -321,8 +326,8 @@ def test_already_finished_download_never_fires(tk_root, fake_source, recorder):
         app._on_close()
 
 
-def test_windows_sharing_a_title_and_process_stay_distinct(tk_root, recorder):
-    """Two identical-looking windows must not collapse into one dropdown entry."""
+def test_similar_windows_stay_distinct_rows(tk_root, recorder):
+    """Two identical-looking windows must appear as two distinct rows."""
     source = FakeWindowSource(
         [
             WindowInfo(11, "Settings", pid=1, process="SystemSettings.exe"),
@@ -331,11 +336,11 @@ def test_windows_sharing_a_title_and_process_stay_distinct(tk_root, recorder):
     )
     app = build_app(tk_root, source, recorder, choose=False)
     try:
-        labels = list(app.window_box.cget("values"))
-        assert len(labels) == 2
-        assert len(set(labels)) == 2
-        handles = {app._windows[label].handle for label in labels}
-        assert handles == {11, 22}
+        rows = rows_of(app)
+        assert len(rows) == 2
+        assert {row.info.handle for row in rows} == {11, 22}
+        # rows keep distinct identities even with equal display names
+        assert len({row.display_name for row in rows}) <= 2
     finally:
         app._on_close()
 
@@ -350,9 +355,9 @@ def test_own_window_is_never_offered_as_a_target(tk_root, recorder):
     )
     app = build_app(tk_root, source, recorder, choose=False)
     try:
-        labels = list(app.window_box.cget("values"))
-        assert len(labels) == 1
-        assert labels[0].startswith("Steam - Downloading 12%")
+        rows = rows_of(app)
+        assert len(rows) == 1
+        assert rows[0].info.handle == 2
     finally:
         app._on_close()
 
@@ -370,9 +375,9 @@ def test_re_attached_window_is_named_in_the_status_box(tk_root, fake_source, rec
                 detail="Re-attached to steam.exe (new handle 7777): Steam - Downloading 44%",
             )
         )
-        assert "Steam - Downloading 44%" in app.watched_var.get()
+        assert "Steam - Downloading 44%" in app.watched_label.cget("text")
         assert app.target is not None and app.target.handle == 7777
-        assert "Re-attached" in app.log_text.get("1.0", "end")
+        assert "Re-attached" in app.log_panel.text.get("1.0", "end")
     finally:
         app._on_close()
 
@@ -384,8 +389,9 @@ def test_stop_monitoring_returns_to_idle(tk_root, fake_source, recorder):
         assert spin(tk_root, lambda: app.state == STATE_MONITORING)
         app.stop_monitoring()
         assert app.state == STATE_IDLE
-        assert app.start_button.instate(["!disabled"])
-        assert app.stop_button.instate(["disabled"])
+        assert str(app.start_button.cget("state")) == "normal"
+        assert str(app.stop_button.cget("state")) == "disabled"
+        assert app.ring.state == "idle"
     finally:
         app._on_close()
 

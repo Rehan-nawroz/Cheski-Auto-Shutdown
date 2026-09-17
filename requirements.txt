@@ -1,3 +1,7 @@
-# Runtime dependency.  pygetwindow uses ctypes on Windows, so pywin32 is NOT
-# required (verified against pygetwindow 0.0.9).
+# Runtime dependencies.  pygetwindow uses ctypes on Windows, so pywin32 is NOT
+# required (verified against pygetwindow 0.0.9).  psutil powers the process
+# picker memory column; Pillow renders the per-process icons (both degrade
+# gracefully if absent).
 pygetwindow==0.0.9
+psutil>=5.9
+Pillow>=10.0

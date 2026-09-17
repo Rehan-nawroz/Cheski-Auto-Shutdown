@@ -1,10 +1,14 @@
-"""tkinter user interface for Cheski Auto Shutdown.
+"""tkinter user interface for Cheski Auto Shutdown — Terminal Precision design.
 
-Threading contract: this module owns the Tk root and is the only place that
-touches widgets.  :class:`~cheski.monitor.MonitorThread` posts
+Threading contract is unchanged: this module owns the Tk root and is the only
+place that touches widgets.  :class:`~cheski.monitor.MonitorThread` posts
 :class:`~cheski.monitor.MonitorEvent` objects onto a queue, and
 :meth:`CheskiApp._pump` drains that queue from the Tk event loop via
 ``root.after``.  Nothing else may call into Tk.
+
+Layout (from the design system): custom chrome header; left column — process
+picker, trigger chips, timing metric cards, dry-run banner; right strip —
+status ring card, watched title, countdown, terminal log, abort pill.
 """
 
 from __future__ import annotations
@@ -50,24 +54,45 @@ from ..monitor import (
 from ..power import PowerController
 from ..triggers import TriggerConfig, TriggerEngine, parse_triggers
 from ..windows import PyGetWindowSource, WindowInfo, WindowSource
-from .countdown import CountdownDialog
+from . import theme
+from .chrome import WindowChrome, add_resize_grip
+from .processes import ProcessRow, build_rows
 from .state import (
     STATE_ABORTED,
     STATE_IDLE,
     STATE_MONITORING,
     STATE_TRIGGERED,
     STATE_WARMING,
-    STATE_TEXT,
+    countdown_body,
     is_live,
     is_running,
-    status_colour,
     status_text,
+)
+from .widgets import (
+    AbortPill,
+    DryRunBanner,
+    GlyphToggle,
+    MetricCard,
+    ProcessPicker,
+    Segmented,
+    StatusRing,
+    TagChipField,
+    TerminalLog,
+    toast,
 )
 
 log = logging.getLogger("cheski.ui")
 
 _POLL_MS = 150
-_MAX_LOG_LINES = 600
+
+# Ring state per app state (design: Idle / Active / Confirmed / Executing).
+RING_STATE = {
+    STATE_IDLE: "idle",
+    STATE_ABORTED: "idle",
+    STATE_WARMING: "active",
+    STATE_MONITORING: "active",
+    STATE_TRIGGERED: "executing",
+}
 
 PowerFactory = Callable[..., PowerController]
 
@@ -100,493 +125,342 @@ class CheskiApp:
         self.engine: TriggerEngine | None = None
         self.target: WindowInfo | None = None
         self.state = STATE_IDLE
-        self._windows: dict[str, WindowInfo] = {}
         self._closing = False
         self._pump_job: str | None = None
-        self.countdown: CountdownDialog | None = None
-        self._logged_titles: set[str] = set()
+        self._countdown_job: str | None = None
+        self._seconds_left = 0
 
-        self.root.title(f"Cheski Auto Shutdown {__version__}")
-        self.root.minsize(640, 620)
+        theme.init_theme(root)
+        self.chrome = WindowChrome(root, "Cheski Auto Shutdown", __version__)
+        self.grip = add_resize_grip(root)
+
         self._build_ui()
-        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.refresh_windows()
-        self._update_preview()
         self._pump_job = self.root.after(_POLL_MS, self._pump)
-        log.info("GUI ready (dry_run=%s)", self.dry_run_var.get())
+        self._apply_state(STATE_IDLE)
+        self.log_panel.append(f"Cheski Auto Shutdown {__version__} ready.")
+        log.info("GUI ready (dry_run=%s)", self.dry_run)
 
     # ------------------------------------------------------------------
-    # Widget construction
+    # UI construction
     # ------------------------------------------------------------------
 
     def _build_ui(self) -> None:
-        style = ttk.Style()
-        for theme in ("vista", "winnative", "clam"):
-            if theme in style.theme_names():
-                try:
-                    style.theme_use(theme)
-                except tk.TclError:  # pragma: no cover
-                    continue
-                break
+        body = tk.Frame(self.root, bg=theme.SURFACE)
+        body.pack(fill="both", expand=True)
+        body.columnconfigure(0, weight=5)
+        body.columnconfigure(1, weight=3)
+        body.rowconfigure(0, weight=1)
 
-        outer = ttk.Frame(self.root, padding=10)
-        outer.pack(fill="both", expand=True)
-        outer.columnconfigure(0, weight=1)
+        left = tk.Frame(body, bg=theme.SURFACE)
+        left.grid(row=0, column=0, sticky="nsew", padx=(16, 8), pady=12)
+        right = tk.Frame(body, bg=theme.SURFACE)
+        right.grid(row=0, column=1, sticky="nsew", padx=(8, 16), pady=12)
 
-        # -- 1. target window -------------------------------------------
-        target_box = ttk.LabelFrame(outer, text="1. Window to watch", padding=8)
-        target_box.grid(row=0, column=0, sticky="ew", pady=(0, 8))
-        target_box.columnconfigure(0, weight=1)
+        # -- left: target picker ----------------------------------------
+        self._section_label(left, "Window to watch")
+        self.picker = ProcessPicker(left, on_select=self._on_row_selected,
+                                    on_refresh=self.refresh_windows)
+        self.picker.pack(fill="x")
 
-        self.window_var = tk.StringVar()
-        self.window_box = ttk.Combobox(
-            target_box, textvariable=self.window_var, state="readonly", width=64
+        # -- left: trigger words ----------------------------------------
+        self._section_label(left, "Trigger words")
+        chips_row = tk.Frame(left, bg=theme.SURFACE)
+        chips_row.pack(fill="x")
+        self.chips = TagChipField(chips_row, on_change=self._on_triggers_changed)
+        self.chips.pack(side="left", fill="x", expand=True)
+        self.segmented = Segmented(chips_row, ["any", "all"], value=self.settings.match_mode,
+                                   on_change=self._on_match_mode_changed, width=110)
+        self.segmented.pack(side="left", padx=(8, 0))
+        self.case_toggle = GlyphToggle(chips_row, "Aa", value=self.settings.case_sensitive,
+                                       on_change=self._on_case_changed, tooltip="Match exact case")
+        self.case_toggle.pack(side="left", padx=(8, 0))
+        self.transition_toggle = GlyphToggle(chips_row, "⟳", value=self.settings.require_transition,
+                                             on_change=self._on_transition_changed,
+                                             tooltip="Only fire after the trigger clears once (recommended)")
+        self.transition_toggle.pack(side="left", padx=(8, 0))
+        self.chips.set_tags(self.settings.triggers)
+
+        # -- left: timing cards ------------------------------------------
+        self._section_label(left, "Timing & safety")
+        cards = tk.Frame(left, bg=theme.SURFACE)
+        cards.pack(fill="x")
+        for col in range(3):
+            cards.columnconfigure(col, weight=1, uniform="metric")
+        self.interval_card = MetricCard(
+            cards, label="Check interval", unit="seconds",
+            value=self.settings.interval_seconds, limits=INTERVAL_RANGE, step=0.5,
+            fmt=lambda v: f"{v:g}",
+            on_committed=lambda _v: self._save_preferences_only(),
         )
-        self.window_box.grid(row=0, column=0, sticky="ew", padx=(0, 6))
-        self.window_box.bind("<<ComboboxSelected>>", lambda _event: self._on_window_selected())
-
-        self.refresh_button = ttk.Button(
-            target_box, text="Refresh list", command=self.refresh_windows
+        self.interval_card.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        self.dwell_card = MetricCard(
+            cards, label="Confirm passes", unit="checks",
+            value=self.settings.dwell_checks, limits=DWELL_RANGE, step=1,
+            fmt=lambda v: f"{v:.0f}",
+            on_committed=lambda _v: self._save_preferences_only(),
         )
-        self.refresh_button.grid(row=0, column=1, sticky="ew")
-
-        self.target_info_var = tk.StringVar(value="No window selected.")
-        ttk.Label(target_box, textvariable=self.target_info_var, foreground="#444").grid(
-            row=1, column=0, columnspan=2, sticky="w", pady=(6, 0)
+        self.dwell_card.grid(row=0, column=1, sticky="nsew", padx=(0, 8))
+        self.delay_card = MetricCard(
+            cards, label="Grace period", unit="seconds",
+            value=self.settings.shutdown_delay_seconds, limits=DELAY_RANGE, step=15,
+            fmt=lambda v: f"{v:.0f}", warn_below=30,
+            on_committed=lambda _v: self._save_preferences_only(),
         )
+        self.delay_card.grid(row=0, column=2, sticky="nsew")
 
-        # -- 2. trigger --------------------------------------------------
-        trigger_box = ttk.LabelFrame(outer, text="2. Trigger words", padding=8)
-        trigger_box.grid(row=1, column=0, sticky="ew", pady=(0, 8))
-        trigger_box.columnconfigure(0, weight=1)
-
-        self.trigger_var = tk.StringVar(value=", ".join(self.settings.triggers))
-        ttk.Entry(trigger_box, textvariable=self.trigger_var, width=40).grid(
-            row=0, column=0, sticky="ew", padx=(0, 6)
-        )
-        self.match_var = tk.StringVar(value=self.settings.match_mode)
-        mode_box = ttk.Frame(trigger_box)
-        mode_box.grid(row=0, column=1, sticky="e")
-        ttk.Radiobutton(mode_box, text="any", value="any", variable=self.match_var).pack(side="left")
-        ttk.Radiobutton(mode_box, text="all", value="all", variable=self.match_var).pack(side="left")
-
-        options = ttk.Frame(trigger_box)
-        options.grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
-        self.case_var = tk.BooleanVar(value=self.settings.case_sensitive)
-        ttk.Checkbutton(options, text="Match exact case", variable=self.case_var).pack(side="left")
-        self.transition_var = tk.BooleanVar(value=self.settings.require_transition)
-        ttk.Checkbutton(
-            options,
-            text="Only fire after the trigger clears once (recommended)",
-            variable=self.transition_var,
-        ).pack(side="left", padx=(12, 0))
-
-        ttk.Label(
-            trigger_box,
-            text=(
-                "Separate several words with commas. 'all' fires only when every word is "
-                "present, which is safer than a bare '100%'."
-            ),
-            foreground="#444",
-            wraplength=580,
-            justify="left",
-        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
-
-        # -- 3. timing ---------------------------------------------------
-        timing_box = ttk.LabelFrame(outer, text="3. Timing and safety", padding=8)
-        timing_box.grid(row=2, column=0, sticky="ew", pady=(0, 8))
-
-        ttk.Label(timing_box, text="Check every").grid(row=0, column=0, sticky="w")
-        self.interval_var = tk.StringVar(value=f"{self.settings.interval_seconds:g}")
-        self.interval_box = ttk.Spinbox(
-            timing_box,
-            from_=INTERVAL_RANGE[0],
-            to=INTERVAL_RANGE[1],
-            increment=0.5,
-            width=6,
-            textvariable=self.interval_var,
-            command=self._update_preview,
-        )
-        self.interval_box.grid(row=0, column=1, sticky="w", padx=(4, 4))
-        ttk.Label(timing_box, text="seconds").grid(row=0, column=2, sticky="w", padx=(0, 16))
-
-        ttk.Label(timing_box, text="Confirm after").grid(row=0, column=3, sticky="w")
-        self.dwell_var = tk.StringVar(value=str(self.settings.dwell_checks))
-        self.dwell_box = ttk.Spinbox(
-            timing_box,
-            from_=DWELL_RANGE[0],
-            to=DWELL_RANGE[1],
-            width=4,
-            textvariable=self.dwell_var,
-        )
-        self.dwell_box.grid(row=0, column=4, sticky="w", padx=(4, 4))
-        ttk.Label(timing_box, text="checks").grid(row=0, column=5, sticky="w", padx=(0, 16))
-
-        ttk.Label(timing_box, text="Shut down after").grid(row=0, column=6, sticky="w")
-        self.delay_var = tk.StringVar(value=str(self.settings.shutdown_delay_seconds))
-        self.delay_box = ttk.Spinbox(
-            timing_box,
-            from_=DELAY_RANGE[0],
-            to=DELAY_RANGE[1],
-            increment=15,
-            width=6,
-            textvariable=self.delay_var,
-            command=self._update_preview,
-        )
-        self.delay_box.grid(row=0, column=7, sticky="w", padx=(4, 4))
-        ttk.Label(timing_box, text="seconds").grid(row=0, column=8, sticky="w")
-        for box in (self.interval_box, self.dwell_box, self.delay_box):
-            self._bind_field(box)
-
-        self.dry_run_var = tk.BooleanVar(value=self.settings.dry_run or self.force_dry_run)
-        dry = ttk.Checkbutton(
-            timing_box,
-            text="Dry run: log the command instead of running it",
-            variable=self.dry_run_var,
-            command=self._update_preview,
-        )
-        dry.grid(row=1, column=0, columnspan=9, sticky="w", pady=(6, 0))
+        # -- left: dry-run banner ----------------------------------------
+        self._section_label(left, "Execution mode")
+        self.dry_banner = DryRunBanner(left, value=self._initial_dry_run(),
+                                       on_change=self._on_dry_run_changed)
+        self.dry_banner.pack(fill="x")
         if self.force_dry_run:
-            dry.state(["disabled"])
+            self.dry_banner.set_value(True)
+            self.dry_banner.set_enabled(False)
 
-        self.preview_var = tk.StringVar()
-        ttk.Label(
-            timing_box,
-            textvariable=self.preview_var,
-            foreground="#0a4",
-            wraplength=600,
-            justify="left",
-        ).grid(row=2, column=0, columnspan=9, sticky="w", pady=(6, 0))
-
-        ttk.Label(
-            timing_box,
-            text=(
-                "Windows force-closes running apps when the countdown hits zero "
-                "(a non-zero timer implies the /f flag), so save your work if you are "
-                "still at the PC."
-            ),
-            foreground="#a30",
-            wraplength=600,
-            justify="left",
-        ).grid(row=3, column=0, columnspan=9, sticky="w", pady=(4, 0))
-
-        # -- 4. controls -------------------------------------------------
-        controls = ttk.Frame(outer)
-        controls.grid(row=3, column=0, sticky="ew", pady=(0, 8))
-
-        self.start_button = ttk.Button(
-            controls, text="Start monitoring", command=self.start_monitoring
+        # -- left: run controls -------------------------------------------
+        controls = tk.Frame(left, bg=theme.SURFACE)
+        controls.pack(fill="x", pady=(12, 0))
+        self.start_button = tk.Button(
+            controls, text="▶  Start monitoring", command=self.start_monitoring,
+            bg=theme.PRIMARY_CONTAINER, fg=theme.ON_PRIMARY,
+            activebackground="#0891b2", activeforeground=theme.ON_PRIMARY,
+            relief="flat", bd=0, font=theme.font("title"), padx=14, pady=7,
+            cursor="hand2",
         )
         self.start_button.pack(side="left")
-        self.stop_button = ttk.Button(controls, text="Stop", command=self.stop_monitoring)
-        self.stop_button.pack(side="left", padx=6)
-
-        self.abort_button = tk.Button(
-            controls,
-            text="EMERGENCY ABORT  (shutdown /a)",
-            command=self.abort_shutdown,
-            bg="#c62828",
-            fg="white",
-            activebackground="#8e0000",
-            activeforeground="white",
-            font=("Segoe UI", 10, "bold"),
-            relief="raised",
-            padx=10,
-            pady=4,
+        self.start_button.bind("<Button-1>", self._start_press)
+        self.stop_button = tk.Button(
+            controls, text="Stop", command=self.stop_monitoring,
+            bg=theme.SURFACE_CONTAINER_HIGH, fg=theme.TEXT_HIGH,
+            activebackground=theme.SURFACE_CONTAINER_HIGHEST,
+            relief="flat", bd=0, font=theme.font("body"), padx=14, pady=7,
+            state="disabled", cursor="hand2",
         )
-        self.abort_button.pack(side="right")
-
-        # -- 5. status ---------------------------------------------------
-        status_box = ttk.LabelFrame(outer, text="Status", padding=8)
-        status_box.grid(row=4, column=0, sticky="ew", pady=(0, 8))
-        status_box.columnconfigure(0, weight=1)
-
-        self.status_var = tk.StringVar(value=STATE_TEXT[STATE_IDLE])
-        self.status_label = ttk.Label(
-            status_box, textvariable=self.status_var, font=("Segoe UI", 10, "bold")
+        self.stop_button.pack(side="left", padx=8)
+        self.progress_bar = ttk.Progressbar(
+            controls, orient="horizontal", mode="determinate", length=140,
+            style="Horizontal.TProgressbar",
         )
-        self.status_label.grid(row=0, column=0, sticky="w")
+        self.progress_bar.pack(side="left", padx=(8, 0))
+        self.progress_bar["value"] = 0
 
-        self.watched_var = tk.StringVar(value="")
-        ttk.Label(
-            status_box, textvariable=self.watched_var, foreground="#1b5e20", wraplength=600,
-            justify="left",
-        ).grid(row=1, column=0, sticky="w", pady=(4, 0))
+        # -- right: status strip ------------------------------------------
+        self._section_label(right, "Status")
+        ring_card = tk.Frame(right, bg=theme.SURFACE_CONTAINER_LOW,
+                             highlightthickness=1, highlightbackground=theme.BORDER)
+        ring_card.pack(fill="x")
+        self.ring = StatusRing(ring_card)
+        self.ring.pack(pady=(10, 2))
 
-        self.progress_var = tk.StringVar(value="")
-        ttk.Label(status_box, textvariable=self.progress_var).grid(
-            row=2, column=0, sticky="w", pady=(4, 0)
+        self.watched_label = tk.Label(
+            ring_card, text="Nothing watched yet", bg=theme.SURFACE_CONTAINER_LOW,
+            fg=theme.TEXT_SECONDARY, font=theme.font("body_small"), wraplength=240,
         )
-
-        self.title_var = tk.StringVar(value="Last title: (nothing seen yet)")
-        ttk.Label(
-            status_box, textvariable=self.title_var, foreground="#333", wraplength=600, justify="left"
-        ).grid(row=3, column=0, sticky="w", pady=(4, 0))
-
-        ttk.Label(status_box, text="Log", foreground="#444").grid(
-            row=4, column=0, sticky="w", pady=(8, 2)
+        self.watched_label.pack(padx=10, anchor="w")
+        self.title_label = tk.Label(
+            ring_card, text="last title: —", bg=theme.SURFACE_CONTAINER_LOW,
+            fg=theme.TEXT_MUTED, font=(theme.mono_family(), 8),
+            wraplength=240, anchor="w", justify="left",
         )
-        log_frame = ttk.Frame(status_box)
-        log_frame.grid(row=5, column=0, sticky="nsew")
-        log_frame.columnconfigure(0, weight=1)
-        log_frame.rowconfigure(0, weight=1)
-        self.log_text = tk.Text(
-            log_frame, height=10, wrap="word", state="disabled", background="#fbfbfb"
-        )
-        self.log_text.grid(row=0, column=0, sticky="nsew")
-        scrollbar = ttk.Scrollbar(log_frame, orient="vertical", command=self.log_text.yview)
-        scrollbar.grid(row=0, column=1, sticky="ns")
-        self.log_text.configure(yscrollcommand=scrollbar.set)
+        self.title_label.pack(padx=10, pady=(2, 8), anchor="w")
 
-        outer.rowconfigure(4, weight=1)
-        status_box.rowconfigure(5, weight=1)
-        self._apply_state(STATE_IDLE)
-        self._append_log(f"Cheski Auto Shutdown {__version__} ready.")
+        self.countdown_label = tk.Label(
+            ring_card, text="", bg=theme.SURFACE_CONTAINER_LOW,
+            fg=theme.CRIMSON, font=theme.font("timer"),
+        )
+        self.countdown_label.pack(pady=(0, 8))
+        self.countdown_label.pack_forget()
+
+        self.log_panel = TerminalLog(right, height=6)
+        self.log_panel.pack(fill="both", expand=True, pady=(10, 0))
+
+        self.abort_pill = AbortPill(right, on_abort=self.abort_shutdown)
+        self.abort_pill.pack(fill="x", pady=(10, 0))
+
+    def _section_label(self, parent, text: str) -> None:
+        tk.Label(
+            parent, text=text.upper(), bg=theme.SURFACE, fg=theme.TEXT_MUTED,
+            font=theme.font("label_caps"),
+        ).pack(anchor="w", pady=(12, 4))
+
+    # ------------------------------------------------------------------
+    # Derived settings from the new widgets
+    # ------------------------------------------------------------------
+
+    def _initial_dry_run(self) -> bool:
+        return bool(self.settings.dry_run or self.force_dry_run)
+
+    @property
+    def dry_run(self) -> bool:
+        return bool(self.dry_banner.value)
+
+    def _on_triggers_changed(self) -> None:
+        self._save_preferences_only()
+
+    def _on_match_mode_changed(self, value: str) -> None:
+        self.settings.match_mode = value
+        self._save_preferences_only()
+
+    def _on_case_changed(self, value: bool) -> None:
+        self.settings.case_sensitive = bool(value)
+        self._save_preferences_only()
+
+    def _on_transition_changed(self, value: bool) -> None:
+        self.settings.require_transition = bool(value)
+        self._save_preferences_only()
+
+    def _on_dry_run_changed(self, value: bool) -> None:
+        if self.force_dry_run:
+            self.dry_banner.set_value(True)
+            return
+        self._save_preferences_only()
+        self.log_panel.append(
+            "DRY RUN is on: the shutdown command will be logged, not executed."
+            if value else
+            "LIVE MODE: the shutdown command will really execute. Be sure before arming.",
+            level="warn" if not value else "info",
+        )
 
     # ------------------------------------------------------------------
     # Window list
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _build_label_map(windows: Sequence[WindowInfo]) -> dict[str, WindowInfo]:
-        """Map dropdown labels to windows, keeping duplicates distinguishable.
-
-        Two windows can share a title *and* a process (two identical dialogs
-        from one app).  Without this, one would silently shadow the other and
-        the user would watch the wrong window.
-        """
-        own_pid = os.getpid()
-        labels: dict[str, WindowInfo] = {}
-        for info in windows:
-            if info.pid and info.pid == own_pid:
-                # Watching our own window can never fire a trigger; offering it
-                # only invites a silent no-op overnight.
-                continue
-            label = info.label
-            if label in labels:
-                label = f"{label} [{info.handle}]"
-            labels[label] = info
-        return labels
-
     def refresh_windows(self) -> None:
-        """Re-enumerate top-level windows and rebuild the dropdown.
+        """Re-scan windows and reload the picker rows.
 
-        The user's choice is never overwritten; a window is preselected only
-        when a previous session's target is recognised.
+        The user's choice is never overwritten; a row is preselected only when
+        a previous session's target is recognised.
         """
+        self.picker.set_scanning(True)
         windows = self.source.list_windows()
-        self._windows = self._build_label_map(windows)
-        labels = list(self._windows)
-        self.window_box.configure(values=labels)
-        self._append_log(f"Found {len(labels)} window(s).")
-
-        current = self.window_box.get()
-        if current and current in self._windows:
-            chosen = current  # keep what the user picked
+        rows = build_rows(windows, own_pid=os.getpid())
+        self.picker.set_rows(rows)
+        self.log_panel.append(f"Found {len(rows)} window(s).")
+        selected = self.picker.selected_row()
+        if selected is not None:
+            self.target = selected.info
         else:
-            chosen = self._remembered_label(labels)  # only if last session had one
-        self.window_box.set(chosen or "")
-        self._on_window_selected()
+            self._restore_remembered(rows)
 
-    def _remembered_label(self, labels: list[str]) -> str | None:
-        """Best-effort restore of the last target from a previous session."""
+    def _restore_remembered(self, rows: list[ProcessRow]) -> None:
         wanted = (self.settings.last_process or "").casefold()
-        hint = (self.settings.last_title_hint or "").casefold()
         if not wanted:
-            return None
-        matches = [label for label in labels if wanted in label.casefold()]
+            return
+        matches = [row for row in rows if wanted in (row.process or "").casefold()]
         if not matches:
-            return None
+            return
+        hint = (self.settings.last_title_hint or "").casefold()
         if hint:
-            scored = sorted(matches, key=lambda label: hint not in label.casefold())
-            return scored[0]
-        return matches[0]
+            matches.sort(key=lambda row: hint not in row.display_name.casefold())
+        self.picker.select_row(matches[0])
 
-    def _on_window_selected(self) -> None:
-        # While a run is live the target is frozen, so the display is put back
-        # rather than being allowed to diverge from what is watched.
-        if self._run_is_live() and self.worker is not None:
-            watched = self.worker.target
-            label = next(
-                (name for name, info in self._windows.items() if info.handle == watched.handle),
-                None,
-            )
-            if label is not None:
-                self.window_box.set(label)
-            self._show_watched(watched)
-            return
-
-        label = self.window_var.get()
-        info = self._windows.get(label)
-        if info is None:
-            self.target = None
-            if self._windows:
-                self.target_info_var.set(
-                    "No window selected. Pick the downloading app from the list above."
-                )
-            else:
-                self.target_info_var.set(
-                    "No selectable windows found. Open the downloading app first, then "
-                    "press Refresh list."
-                )
-            return
-        self.target = info
-        details = [f"handle {info.handle}"]
-        if info.pid:
-            details.append(f"pid {info.pid}")
-        if info.process:
-            details.append(info.process)
-        self.target_info_var.set(
-            f"Selected: {info.title or '(untitled)'}  [{', '.join(details)}]"
-        )
+    def _on_row_selected(self, row: ProcessRow) -> None:
+        self.target = row.info
+        self.log_panel.append(f"Selected: {row.display_name} ({row.process}, pid {row.pid})")
 
     def _selected_window(self) -> WindowInfo | None:
         if self.target is not None:
             return self.target
-        return self._windows.get(self.window_var.get())
+        row = self.picker.selected_row()
+        return row.info if row is not None else None
 
     # ------------------------------------------------------------------
-    # Spinbox value helpers (never trust a text field)
+    # Monitoring lifecycle
     # ------------------------------------------------------------------
-
-    def _bind_field(self, widget) -> None:
-        """Keep the preview honest while typing, and settle the field on exit."""
-        widget.bind("<KeyRelease>", lambda _event: self._update_preview())
-        widget.bind("<FocusOut>", lambda _event: self._settle_fields())
-
-    def _settle_fields(self) -> None:
-        """Write the accepted (clamped) values back into the fields."""
-        self.interval_var.set(f"{self._interval_value():g}")
-        self.dwell_var.set(str(self._dwell_value()))
-        self.delay_var.set(str(self._delay_value()))
-        self._update_preview()
 
     def _worker_running(self) -> bool:
-        """True while a worker thread is alive, whatever the state says."""
         return self.worker is not None and self.worker.is_alive()
 
     def _run_is_live(self) -> bool:
         """True while a run is in flight (arming, watching, or counting down)."""
         return is_live(self.state) or self._worker_running()
 
-    def _show_watched(self, target: WindowInfo | None) -> None:
-        if target is None:
-            self.watched_var.set("")
-        else:
-            self.watched_var.set(
-                f"Watching: {target.title or '(untitled)'}  [handle {target.handle}]"
-            )
-
-    def _number(self, variable: tk.StringVar, default: float, limits: tuple[float, float], *, as_int: bool) -> float:
-        try:
-            value = float(variable.get())
-        except (TypeError, ValueError):
-            value = default
-        value = clamp(value, limits[0], limits[1])
-        return int(value) if as_int else round(value, 2)
-
-    def _interval_value(self) -> float:
-        return self._number(self.interval_var, self.settings.interval_seconds, INTERVAL_RANGE, as_int=False)
-
-    def _dwell_value(self) -> int:
-        return int(self._number(self.dwell_var, self.settings.dwell_checks, DWELL_RANGE, as_int=True))
-
-    def _delay_value(self) -> int:
-        return int(
-            self._number(
-                self.delay_var, self.settings.shutdown_delay_seconds, DELAY_RANGE, as_int=True
-            )
-        )
-
-    def _make_power(self) -> PowerController:
-        return self.power_factory(seconds=self._delay_value(), dry_run=self.dry_run_var.get())
-
-    def _update_preview(self) -> None:
-        try:
-            preview = self._make_power().describe()
-        except Exception as exc:  # pragma: no cover - defensive
-            preview = f"(could not build the command: {exc})"
-        self.preview_var.set(f"Command that will be run: {preview}")
-
-    # ------------------------------------------------------------------
-    # Monitoring lifecycle
-    # ------------------------------------------------------------------
-
     def start_monitoring(self) -> bool:
         """Validate the form and start the worker thread."""
-        if self.worker is not None and self.worker.is_alive():
+        if self._worker_running():
             return False
 
-        # Make the fields show what the run will actually use before reading
-        # them, so the displayed value and the real value cannot disagree.
-        self._settle_fields()
-
-        triggers = parse_triggers(self.trigger_var.get())
+        triggers = self.chips.tags()
         if not triggers:
-            messagebox.showerror(
-                "Trigger needed",
-                "Enter at least one trigger word, for example 100% or Complete.",
-            )
+            self.log_panel.append("Enter at least one trigger word first.", level="warn")
+            toast(self.root, "Add a trigger word first", kind="warn")
             return False
 
         target = self._selected_window()
         if target is None:
-            messagebox.showerror(
-                "No window selected",
-                "Press 'Refresh list' and pick the window whose title bar shows the "
-                "download progress.",
-            )
+            self.log_panel.append("No window selected — pick one from the list.", level="warn")
+            toast(self.root, "Pick a window to watch", kind="warn")
             return False
 
         config = TriggerConfig(
             triggers=triggers,
-            match_mode=self.match_var.get(),
-            case_sensitive=self.case_var.get(),
-            dwell_checks=self._dwell_value(),
-            require_transition=self.transition_var.get(),
+            match_mode=self.segmented.value,
+            case_sensitive=self.case_toggle.value,
+            dwell_checks=int(self.dwell_card.get()),
+            require_transition=self.transition_toggle.value,
         )
         self.engine = TriggerEngine(config)
         self.engine.reset()
         self.stop_event = threading.Event()
         self.events = queue.Queue()
-        self._logged_titles.clear()
 
         self.worker = MonitorThread(
             self.source,
             target,
             self.engine,
-            interval=self._interval_value(),
+            interval=max(0.2, float(self.interval_card.get())),
             events=self.events,
             stop_event=self.stop_event,
         )
         self.worker.start()
-        self._show_watched(target)
+        self._show_watched(f"{target.title or '(untitled)'}  [handle {target.handle}]")
 
         self._persist()
-        self._append_log(
+        self.log_panel.append(
             "Monitoring '{title}' for {words} (mode={mode}, every {interval}s, "
             "confirm after {dwell} check(s)).".format(
                 title=target.title or "(untitled)",
                 words=", ".join(triggers),
                 mode=config.match_mode,
-                interval=self._interval_value(),
+                interval=self.interval_card.get(),
                 dwell=config.dwell_checks,
             )
         )
-        if self.dry_run_var.get():
-            self._append_log("DRY RUN is on: the shutdown command will be logged, not executed.")
+        if self.dry_run:
+            self.log_panel.append("DRY RUN is on: the shutdown command will be logged, not executed.")
         self._apply_state(STATE_WARMING)
         return True
+
+    def _start_press(self, _event=None) -> None:
+        """Fill the arming progress bar; it drains once armed or stopped."""
+        if self._worker_running():
+            return
+        self.progress_bar.configure(maximum=100, value=0)
+        self._arm_fill(0)
+
+    def _arm_fill(self, value: float) -> None:
+        if self._closing:
+            return
+        if self.state in (STATE_WARMING, STATE_MONITORING):
+            self.progress_bar["value"] = min(100, value + 8)
+            self._pump_job = self.root.after(60, lambda: self._arm_fill(value + 8))
+        elif self.state == STATE_IDLE:
+            self.progress_bar["value"] = 0
 
     def stop_monitoring(self) -> None:
         """Stop the worker thread.  Does not touch any pending shutdown."""
         self._stop_worker()
-        self._append_log("Monitoring stopped.")
-        self._apply_state(STATE_IDLE)
-        self._on_window_selected()
+        self.log_panel.append("Monitoring stopped.")
+        if self.state != STATE_TRIGGERED:
+            # A pending countdown outranks Stop: stay TRIGGERED until the user
+            # aborts (or the timer runs out), otherwise the panel would claim
+            # "Idle" while a shutdown is still scheduled.
+            self._apply_state(STATE_IDLE)
+        self.progress_bar["value"] = 0
 
     def _stop_worker(self) -> None:
-        """Ask the worker to finish and drop the reference to it."""
         if self.worker is not None:
             self.worker.request_stop()
             self.stop_event.set()
@@ -595,37 +469,42 @@ class CheskiApp:
     def abort_shutdown(self) -> None:
         """Run ``shutdown /a`` -- cancels a pending shutdown."""
         result = self._make_power().abort_shutdown()
-        self._append_log(f"$ {result.command_line}")
-        self._append_log(f"  -> rc={result.returncode} {result.message}")
-        self._close_countdown()
+        self.log_panel.append(f"$ {result.command_line}")
+        self.log_panel.append(f"  -> rc={result.returncode} {result.message}")
+        self._cancel_countdown()
         if result.ok:
             self._apply_state(STATE_ABORTED)
-            messagebox.showinfo("Shutdown cancelled", result.message)
+            toast(self.root, "Shutdown cancelled", kind="info")
         else:
             if result.returncode == 1116:
                 # Nothing was pending, so nothing is going to happen either.
                 self._apply_state(STATE_IDLE)
-            messagebox.showwarning("Nothing to abort", result.message)
+            toast(self.root, "Nothing to abort", kind="warn")
+
+    def _make_power(self) -> PowerController:
+        return self.power_factory(
+            seconds=int(self.delay_card.get()), dry_run=self.dry_run
+        )
 
     # ------------------------------------------------------------------
     # Triggered: schedule the shutdown and run the countdown
     # ------------------------------------------------------------------
 
     def _on_trigger(self, event: MonitorEvent) -> None:
-        """Schedule the shutdown and open the countdown window.
+        """Schedule the shutdown and start the in-panel countdown.
 
-        The countdown dialog is the only way to cancel a pending shutdown, so
-        the closing handler aborts for the user rather than leaving a scheduled
-        shutdown with no UI.
+        The countdown lives in the status strip and the abort pill is the only
+        way to cancel, so the closing handler aborts for the user rather than
+        leaving a scheduled shutdown with no UI.
         """
         self._apply_state(STATE_TRIGGERED)
-        self._append_log(f"TRIGGER MATCHED: {event.title!r} ({event.detail})")
+        self.log_panel.append(f"TRIGGER MATCHED: {event.title!r} ({event.detail})", level="warn")
         self._beep()
 
-        seconds = self._delay_value()
+        seconds = int(self.delay_card.get())
         result = self._make_power().schedule_shutdown()
-        self._append_log(f"$ {result.command_line}")
-        self._append_log(f"  -> rc={result.returncode} {result.message}")
+        self.log_panel.append(f"$ {result.command_line}")
+        self.log_panel.append(f"  -> rc={result.returncode} {result.message}")
 
         if not result.ok:
             # Nothing was scheduled, so there is nothing to count down to.
@@ -637,17 +516,35 @@ class CheskiApp:
             return
 
         self._stop_worker()
-        self.countdown = CountdownDialog(
-            self.root,
-            seconds=seconds,
-            dry_run=result.dry_run,
-            on_abort=self.abort_shutdown,
+        self._seconds_left = seconds
+        self.countdown_label.configure(
+            text=self._mmss(self._seconds_left), fg=theme.CRIMSON
         )
+        self.countdown_label.pack(pady=(0, 8))
+        self._tick_countdown()
 
-    def _close_countdown(self) -> None:
-        if self.countdown is not None:
-            self.countdown.destroy()
-            self.countdown = None
+    @staticmethod
+    def _mmss(total: int) -> str:
+        return f"{total // 60:02d}:{total % 60:02d}"
+
+    def _tick_countdown(self) -> None:
+        if self._closing or self.state != STATE_TRIGGERED:
+            return
+        if self._seconds_left <= 0:
+            self.countdown_label.configure(text="Shutting down now…")
+            return
+        self.countdown_label.configure(text=self._mmss(self._seconds_left))
+        self._seconds_left -= 1
+        self._countdown_job = self.root.after(1000, self._tick_countdown)
+
+    def _cancel_countdown(self) -> None:
+        if self._countdown_job is not None:
+            try:
+                self.root.after_cancel(self._countdown_job)
+            except tk.TclError:  # pragma: no cover
+                pass
+            self._countdown_job = None
+        self.countdown_label.pack_forget()
 
     def _beep(self) -> None:
         try:
@@ -681,26 +578,17 @@ class CheskiApp:
     def handle_event(self, event: MonitorEvent) -> None:
         """Apply one worker event to the UI.  Pure widget work, no I/O."""
         if event.kind == KIND_TICK:
-            self.title_var.set(f"Last title: {event.title}")
+            self.title_label.configure(text=f"last title: {event.title}")
             if self._run_is_live() and self.worker is not None:
-                # Keep "Watching:" naming the window with the title it has right
-                # now, so it never reads as a stale claim about the target.
                 self._show_watched(
-                    WindowInfo(
-                        handle=self.worker.target.handle,
-                        title=event.title,
-                        process=self.worker.target.process,
-                    )
+                    f"{event.title or '(untitled)'}  [handle {self.worker.target.handle}]"
                 )
-            if event.title not in self._logged_titles:
-                self._logged_titles.add(event.title)
-                self._append_log(f"title: {event.title}")
             if event.streak:
-                self.progress_var.set(
-                    f"Matching {event.streak}/{self._dwell_value()} - {event.detail}"
+                self.watched_label.configure(
+                    text=f"matching {event.streak}/{int(self.dwell_card.get())} — {event.detail}"
                 )
-            else:
-                self.progress_var.set(event.detail)
+            elif event.detail:
+                self.watched_label.configure(text=event.detail)
             if self.state == STATE_WARMING and event.armed:
                 self._apply_state(STATE_MONITORING)
             elif self.state == STATE_MONITORING and not event.armed:
@@ -708,26 +596,25 @@ class CheskiApp:
         elif event.kind == KIND_MATCH:
             self._on_trigger(event)
         elif event.kind == KIND_TARGET_LOST:
-            self.progress_var.set(event.detail)
-            self._append_log(f"WARNING: {event.detail}")
+            self.watched_label.configure(text=event.detail)
+            self.log_panel.append(f"WARNING: {event.detail}", level="warn")
         elif event.kind == KIND_TARGET_REATTACHED:
-            self._append_log(event.detail)
-            self.progress_var.set(event.detail)
+            self.log_panel.append(event.detail)
+            self.watched_label.configure(text=event.detail)
             if event.handle:
-                # The "Watching:" line is the user's only proof of what is being
-                # read, so it has to follow a re-attach.
                 moved = WindowInfo(handle=event.handle, title=event.title)
                 self.target = moved
-                self._show_watched(moved)
+                self._show_watched(f"{event.title or '(untitled)'}  [handle {event.handle}]")
         elif event.kind == KIND_ERROR:
-            self.progress_var.set(f"Poll error: {event.detail}")
-            self._append_log(f"ERROR: {event.detail}")
+            self.watched_label.configure(text=f"Poll error: {event.detail}")
+            self.log_panel.append(f"ERROR: {event.detail}", level="error")
         elif event.kind == KIND_STOPPED:
             if self.state in (STATE_WARMING, STATE_MONITORING):
                 self._apply_state(STATE_IDLE)
-                self._append_log("Monitor thread finished.")
-        else:  # pragma: no cover - unknown kinds are logged, not fatal
-            self._append_log(f"Unhandled event: {event.kind}")
+                self.log_panel.append("Monitor thread finished.")
+
+    def _show_watched(self, text: str) -> None:
+        self.watched_label.configure(text=text)
 
     # ------------------------------------------------------------------
     # Chrome
@@ -736,45 +623,41 @@ class CheskiApp:
     def _apply_state(self, state: str) -> None:
         """Apply one run state to the widgets it governs."""
         self.state = state
-        self.status_var.set(status_text(state))
+        self.ring.set_state(RING_STATE.get(state, "idle"))
         running = is_running(state)
         live = is_live(state)
         self.start_button.configure(state="disabled" if live else "normal")
         self.stop_button.configure(state="normal" if running else "disabled")
-        # Lock the target picker whenever a run is in flight, so the panel and
-        # the monitor can never advertise different windows.
-        self.window_box.configure(state="disabled" if live else "readonly")
-        self.refresh_button.configure(state="disabled" if live else "normal")
+        # Lock the picker whenever a run is in flight, so the panel and the
+        # monitor can never advertise different windows.
+        picker_state = "disabled" if live else "normal"
+        self.picker.search_entry.configure(state=picker_state)
+        for child in self.picker.inner.winfo_children():
+            try:
+                child.configure(state=picker_state)
+            except tk.TclError:
+                pass
         if live and self.worker is not None:
-            self._show_watched(self.worker.target)
-        elif state != STATE_TRIGGERED:
-            self._show_watched(None)
-        self.status_label.configure(foreground=status_colour(state))
+            self._show_watched(
+                f"{self.worker.target.title or '(untitled)'}  [handle {self.worker.target.handle}]"
+            )
+        elif state != STATE_TRIGGERED and state != STATE_ABORTED:
+            self._show_watched("Nothing watched yet" if state == STATE_IDLE else self.watched_label.cget("text"))
 
-    def _append_log(self, message: str) -> None:
-        line = f"[{time.strftime('%H:%M:%S')}] {message}\n"
-        self.log_text.configure(state="normal")
-        self.log_text.insert("end", line)
-        # Keep the pane bounded so an all-night run cannot eat memory.
-        try:
-            lines = int(self.log_text.index("end-1c").split(".")[0])
-            if lines > _MAX_LOG_LINES:
-                self.log_text.delete("1.0", f"{lines - _MAX_LOG_LINES}.0")
-        except (ValueError, tk.TclError):  # pragma: no cover
-            pass
-        self.log_text.see("end")
-        self.log_text.configure(state="disabled")
+    # ------------------------------------------------------------------
+    # Persistence
+    # ------------------------------------------------------------------
 
     def _persist(self) -> None:
         target = self._selected_window()
-        self.settings.triggers = parse_triggers(self.trigger_var.get())
-        self.settings.match_mode = self.match_var.get()
-        self.settings.case_sensitive = bool(self.case_var.get())
-        self.settings.require_transition = bool(self.transition_var.get())
-        self.settings.interval_seconds = self._interval_value()
-        self.settings.dwell_checks = self._dwell_value()
-        self.settings.shutdown_delay_seconds = self._delay_value()
-        self.settings.dry_run = bool(self.dry_run_var.get())
+        self.settings.triggers = self.chips.tags()
+        self.settings.match_mode = self.segmented.value
+        self.settings.case_sensitive = bool(self.case_toggle.value)
+        self.settings.require_transition = bool(self.transition_toggle.value)
+        self.settings.interval_seconds = float(self.interval_card.get())
+        self.settings.dwell_checks = int(self.dwell_card.get())
+        self.settings.shutdown_delay_seconds = int(self.delay_card.get())
+        self.settings.dry_run = self.dry_run
         if target is not None:
             self.settings.last_process = target.process
             self.settings.last_title_hint = target.title
@@ -782,26 +665,28 @@ class CheskiApp:
 
     def _save_preferences_only(self) -> None:
         """Persist form values without claiming a target when one is absent."""
-        self.settings.triggers = parse_triggers(self.trigger_var.get()) or self.settings.triggers
-        self.settings.match_mode = self.match_var.get()
-        self.settings.case_sensitive = bool(self.case_var.get())
-        self.settings.require_transition = bool(self.transition_var.get())
-        self.settings.interval_seconds = self._interval_value()
-        self.settings.dwell_checks = self._dwell_value()
-        self.settings.shutdown_delay_seconds = self._delay_value()
-        self.settings.dry_run = bool(self.dry_run_var.get())
+        if not hasattr(self, "interval_card"):
+            return  # widgets still under construction; nothing to persist yet
+        self.settings.triggers = self.chips.tags() or self.settings.triggers
+        self.settings.match_mode = self.segmented.value
+        self.settings.case_sensitive = bool(self.case_toggle.value)
+        self.settings.require_transition = bool(self.transition_toggle.value)
+        self.settings.interval_seconds = float(self.interval_card.get())
+        self.settings.dwell_checks = int(self.dwell_card.get())
+        self.settings.shutdown_delay_seconds = int(self.delay_card.get())
+        self.settings.dry_run = self.dry_run
         save_settings(self.settings)
 
     def _on_close(self) -> None:
         """Shut down cleanly -- and never leave an unattended pending shutdown."""
         self._closing = True
         if self.state == STATE_TRIGGERED:
-            # The countdown dialog is the only way to cancel, so cancel for the
-            # user rather than leaving a scheduled shutdown with no UI.
+            # The abort pill is the only way to cancel, so cancel for the user
+            # rather than leaving a scheduled shutdown with no UI.
             result = self._make_power().abort_shutdown()
-            self._append_log(f"$ {result.command_line}")
-            self._append_log(f"  -> rc={result.returncode} {result.message}")
-        self._close_countdown()
+            self.log_panel.append(f"$ {result.command_line}")
+            self.log_panel.append(f"  -> rc={result.returncode} {result.message}")
+        self._cancel_countdown()
         if self.worker is not None:
             self.worker.request_stop()
             self.stop_event.set()
@@ -822,6 +707,7 @@ class CheskiApp:
 # ----------------------------------------------------------------------
 # Entry point
 # ----------------------------------------------------------------------
+
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(

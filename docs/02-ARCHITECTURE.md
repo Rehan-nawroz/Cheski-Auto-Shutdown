@@ -12,9 +12,13 @@ cheski/
 ├── monitor.py           MonitorThread: the polling loop, emits events
 ├── power.py             PowerController: the only place that can shut the PC down
 └── ui/
+    ├── theme.py         Terminal Precision palette, font fallbacks, blend maths, ttk theme
+    ├── icons.py         real window icons via ctypes+PIL, geometric fallback avatars (LRU)
+    ├── processes.py     process rows: windows + psutil memory, UWP naming, search text
+    ├── widgets.py       canvas widgets: picker, chips, segmented, metric cards, ring, terminal log, abort pill, toast
+    ├── chrome.py        borderless window chrome: header, window controls, drag, resize grip
     ├── state.py         run states + widget policy + countdown text (no tkinter)
-    ├── countdown.py     CountdownDialog: the pending-shutdown window and its tick loop
-    └── app.py           CheskiApp: widgets, wiring, event pump, main()
+    └── app.py           CheskiApp: wiring, event pump, persistence, main()
 ```
 
 Dependencies flow one way and there are no cycles:
@@ -31,10 +35,50 @@ ui/app.py ──> monitor.py ──> triggers.py
 `ui/state.py` holds the run-state vocabulary and the widget policy each state
 implies (can Start be pressed? is the picker frozen?) as plain functions and
 dicts with no tkinter import, so the decisions are unit-testable headlessly.
-`ui/countdown.py` owns the pending-shutdown window; it takes an ``on_abort`
-callback and never talks to the power layer itself.
 
-Only `power.py` executes anything destructive. Only `ui/app.py` touches
+Only `power.py` executes anything destructive. Only `ui/app.py` wires
+widgets to behaviour; the visual components themselves live in `ui/widgets.py`
+and know nothing about shutdown semantics.
+
+### 1.1 The Terminal Precision redesign
+
+The interface is the "Terminal Precision" design system (dark telemetry
+theme, cyan `#06b6d4` primary, amber warnings, crimson abort).  How it maps
+to code:
+
+* **`ui/theme.py`** owns every visual constant: the palette tokens, the font
+  fallback chains (the design names Geist / Inter / JetBrains Mono; on a
+  stock Windows box these resolve to Segoe UI / Consolas, and the resolved
+  family is published for canvases), RGB blend helpers for animation
+  in-betweens, alpha-over-surface compositing (tk has no real alpha), and the
+  private ttk theme.
+* **`ui/widgets.py`** is the canvas-drawn component set: the searchable
+  process picker (double-click to select, animated reload, scanning pulse),
+  trigger chips (removable pills), the ANY/ALL segmented control, metric
+  cards (large number, +/- steppers, count-up animation, amber pulse when the
+  grace period drops below 30 s), the dry-run banner (flask icon, SAFE/LIVE
+  badge, amber tint when live), the status ring (idle dim, slow spin when
+  armed, fast when executing), the terminal log (coloured levels,
+  auto-scroll lock, copy-all, bounded to 600 lines), the abort pill (hover
+  fill, press shake) and toasts.
+* **`ui/icons.py`** extracts real per-process window icons (HWND,
+  WM_GETICON/GetClassLongPtrW, module path, SHGetFileInfoW, decoded with
+  Pillow) and falls back to deterministic geometric avatars; results are
+  LRU-capped so an overnight run cannot accumulate them.
+* **`ui/processes.py`** builds picker rows: windows enriched with psutil
+  memory (optional at runtime), UWP hosts named by their window title, own
+  process excluded, sorted by display name.
+* **`ui/chrome.py`** replaces the native title bar with a styled header
+  (logomark, name, version badge, window controls) on a borderless window,
+  with edge-drag movement and a resize grip; it falls back to the native
+  frame when the window manager refuses the override.
+* **The countdown moved out of the pop-up dialog** into the status strip:
+  large mm:ss readout, red, above the always-visible abort pill.  Closing the
+  window while triggered still aborts the pending shutdown for the user.
+
+Only the *wiring* changed.  The engine, monitor, power layer and their
+guarantees (arming guard, dwell, handle binding, argv-only commands) are
+untouched./app.py` touches
 widgets.
 
 ## 2. Run-time data flow

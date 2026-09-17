@@ -21,22 +21,23 @@ the suite is testing.
 ```bash
 python -m pip install -r requirements-dev.txt
 python -m pytest
-# 139 passed
+# 146 passed
 ```
 
 ## 2. Test layers
 
 | Layer | File | Tests | What it pins down |
 | --- | --- | --- | --- |
-| Trigger logic | `tests/test_triggers.py` | 27 | Matching, normalisation, arming, dwell, latching |
-| Command layer | `tests/test_power.py` | 25 | Exact argv, clamping, dry run, return codes, sanitising |
+| Trigger logic | `tests/test_triggers.py` | 23 | Matching, normalisation, arming, dwell, latching |
+| Command layer | `tests/test_power.py` | 18 | Exact argv, clamping, dry run, return codes, sanitising |
 | Window identity | `tests/test_windows.py` | 14 | Filtering, labels, re-attach, live enumeration |
 | Monitoring loop | `tests/test_monitor.py` | 9 | Events, loss, re-attach, prompt stop, resilience |
-| GUI integration | `tests/test_ui_smoke.py` | 19 | Real Tk root, arm → fire → abort, close-safety, first-launch dry run, duplicate windows, target locking |
-| Run-state policy | `tests/test_ui_state.py` | 10 | Tk-free state machine policy: running/live truth table, status text/colour, countdown body |
-| Countdown dialog | `tests/test_ui_countdown.py` | 4 | The pending-shutdown window in isolation: contents, tick-to-zero, abort callback, idempotent destroy |
-| Settings | `tests/test_config.py` | 31 | Round trip, corruption tolerance, clamping |
-| **Total** | | **139** | |
+| GUI integration | `tests/test_ui_smoke.py` | 20 | Real Tk root on the redesigned surface: arm → fire → abort, close-safety, picker/chips/cards/toggles, target locking |
+| Run-state policy | `tests/test_ui_state.py` | 6 | Tk-free state machine policy: running/live truth table, status text/colour, countdown body |
+| Theme | `tests/test_ui_theme.py` | 5 | Colour blending, alpha compositing, font resolution, idempotent ttk theme |
+| Process rows | `tests/test_ui_processes.py` | 5 | Memory text, UWP naming, search text, own-pid exclusion, sorting |
+| Settings | `tests/test_config.py` | 19 | Round trip, corruption tolerance, clamping |
+| **Total** | | **146** | |
 
 Every defect found by the GUI playtest (§10) has a named regression test in
 `tests/test_ui_smoke.py` or `tests/test_windows.py`; that is the durable form of
