@@ -24,6 +24,10 @@ env/
 # Agent workspace
 .freebuff/
 
+# Local-only folders
+/docs/
+/tests/
+
 # Local
 *.log
 playtest_log.txt
