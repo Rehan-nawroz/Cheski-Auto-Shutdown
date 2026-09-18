@@ -52,7 +52,9 @@ from ..monitor import (
     MonitorEvent,
     MonitorThread,
 )
+from ..network import ProcessActivitySampler
 from ..power import PowerController
+from ..config import IDLE_RANGE
 from ..triggers import TriggerConfig, TriggerEngine, parse_triggers
 from ..windows import PyGetWindowSource, WindowInfo, WindowSource
 from . import theme
@@ -231,6 +233,31 @@ class CheskiApp:
             bg=theme.SURFACE, fg=theme.TEXT_SECONDARY, font=theme.font("body_small"),
         ).pack(side="left", padx=(8, 0))
 
+        idle_row = tk.Frame(left, bg=theme.SURFACE)
+        idle_row.pack(fill="x", pady=(0, 4))
+        self.idle_toggle = GlyphToggle(
+            idle_row, "⇵", value=bool(self.settings.network_idle_mode),
+            on_change=self._on_idle_mode_changed,
+            tooltip="Also fire when the app transfers data and then sits at zero (for apps with no title progress)",
+        )
+        self.idle_toggle.pack(side="left")
+        tk.Label(
+            idle_row, text="network idle mode",
+            bg=theme.SURFACE, fg=theme.TEXT_SECONDARY, font=theme.font("body_small"),
+        ).pack(side="left", padx=(8, 0))
+        tk.Label(
+            idle_row, text="fires after", bg=theme.SURFACE,
+            fg=theme.TEXT_MUTED, font=theme.font("body_small"),
+        ).pack(side="left", padx=(16, 4))
+        self.idle_seconds_card = MetricCard(
+            idle_row, label="", unit="quiet", value=self.settings.network_idle_seconds,
+            limits=IDLE_RANGE, step=30,
+            fmt=lambda v: f"{v:.0f}",
+            on_committed=lambda _v: self._on_idle_seconds_changed(self.idle_seconds_card.get()),
+        )
+        self.idle_seconds_card.configure(width=170)
+        self.idle_seconds_card.pack(side="left", padx=(4, 0))
+
         self.dry_banner = DryRunBanner(left, value=self._initial_dry_run(),
                                        on_change=self._on_dry_run_changed)
         self.dry_banner.pack(fill="x")
@@ -340,6 +367,14 @@ class CheskiApp:
         self.settings.watch_process_windows = bool(value)
         self._save_preferences_only()
 
+    def _on_idle_mode_changed(self, value: bool) -> None:
+        self.settings.network_idle_mode = bool(value)
+        self._save_preferences_only()
+
+    def _on_idle_seconds_changed(self, value: float) -> None:
+        self.settings.network_idle_seconds = float(value)
+        self._save_preferences_only()
+
     def _on_dry_run_changed(self, value: bool) -> None:
         if self.force_dry_run:
             self.dry_banner.set_value(True)
@@ -412,9 +447,13 @@ class CheskiApp:
             return False
 
         triggers = self.chips.tags()
-        if not triggers:
-            self.log_panel.append("Enter at least one trigger word first.", level="warn")
-            toast(self.root, "Add a trigger word first", kind="warn")
+        idle_on = bool(self.idle_toggle.value)
+        if not triggers and not idle_on:
+            self.log_panel.append(
+                "Enter at least one trigger word, or turn on network idle mode.",
+                level="warn",
+            )
+            toast(self.root, "Add a trigger word or enable network idle", kind="warn")
             return False
 
         target = self._selected_window()
@@ -435,6 +474,15 @@ class CheskiApp:
         self.stop_event = threading.Event()
         self.events = queue.Queue()
 
+        sampler = None
+        if idle_on and target.pid:
+            sampler = ProcessActivitySampler(int(target.pid))
+        elif idle_on:
+            self.log_panel.append(
+                "Network idle mode needs a process id; watching title words only.",
+                level="warn",
+            )
+
         self.worker = MonitorThread(
             self.source,
             target,
@@ -443,16 +491,23 @@ class CheskiApp:
             events=self.events,
             stop_event=self.stop_event,
             watch_process=bool(self.settings.watch_process_windows),
+            sampler=sampler,
+            idle_seconds=float(self.idle_seconds_card.get()),
         )
         self.worker.start()
         self._show_watched(f"{target.title or '(untitled)'}  [handle {target.handle}]")
 
         self._persist()
         self.log_panel.append(
-            "Monitoring '{title}' for {words} (mode={mode}, every {interval}s, "
+            "Monitoring '{title}' for {words}{idle} (mode={mode}, every {interval}s, "
             "confirm after {dwell} check(s)).".format(
                 title=target.title or "(untitled)",
-                words=", ".join(triggers),
+                words=", ".join(triggers) if triggers else "no title words",
+                idle=(
+                    f" + network idle ({self.idle_seconds_card.get():.0f}s quiet)"
+                    if idle_on and sampler is not None
+                    else (" + network idle (no pid)" if idle_on else "")
+                ),
                 mode=config.match_mode,
                 interval=self.interval_card.get(),
                 dwell=config.dwell_checks,

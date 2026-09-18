@@ -22,6 +22,13 @@ process as your target, so its title is seen the instant it pops. You can turn
 this off with the **⤢ watch all windows of the app** toggle if you want the
 old exact-window behavior.
 
+And for apps that never publish progress in *any* title bar — qBittorrent and
+Steam are the classic cases — there is **⇵ network idle mode**: it watches the
+target process's activity (bytes written + read) and fires when the app
+**transferred data and then sat at zero** for the idle limit (default 5
+minutes). Two-part rule, so it is safe: an app that never transfers can never
+fire, and a stall inside the limit just resumes.
+
 ## Requirements
 
 * Windows (the tool drives `shutdown.exe`)
@@ -49,6 +56,8 @@ python -m pip install -r requirements.txt
    cover IDM's `Download complete` and almost every downloader's finish text.
    Matching is a case-insensitive substring test: `complete` matches both
    `Download complete` and `completed`.
+   *Watching qBittorrent, Steam, or another app with no title progress? Turn
+   on **⇵ network idle mode** instead — trigger words are then optional.*
 5. Your first launch starts in **Dry run mode** (badge says SAFE): the
    shutdown command is logged, not executed. Press **Start monitoring** and
    watch the log.
@@ -65,6 +74,11 @@ python -m pip install -r requirements.txt
   title already says `100%` when you press Start, Cheski sits in *Arming*
   and refuses to fire until it sees the trigger disappear and come back.
   This is what makes an accidental Start harmless.
+* With **⇵ network idle mode** on, it also samples the target process's
+  disk activity each poll. Firing needs activity seen first, then zero for
+  the whole idle limit (the `quiet` card next to the toggle, 30–1800 s,
+  default 300). A download that stalls resumes; an app that never wrote
+  anything never fires.
 
 ## The interface
 
@@ -75,6 +89,7 @@ python -m pip install -r requirements.txt
 | **Check interval / Confirm passes / Grace period** | The three timing cards. Grace period is the abort window in seconds (15–600, default 60); it pulses amber below 30. |
 | **Dry run mode banner** | SAFE (teal) logs the command; LIVE (amber) really schedules it. |
 | **Status ring** | Idle / Active / Confirmed / Executing, with the watched window, its last title, and a big red `mm:ss` countdown when a shutdown is pending. |
+| **⤢ / ⇵ toggles** | `⤢` watches all windows of the app (default on). `⇵` enables network idle mode with its `quiet` seconds card — the trigger for apps with no title progress. |
 | **⬡ Abort shutdown** | The red pill. Cancels the pending Windows shutdown immediately (`shutdown /a`). |
 | **Event log** | Timestamped record of every poll event, with copy-all and auto-scroll lock. |
 
@@ -125,9 +140,11 @@ unattended night can be checked afterwards.
 ## Known limitations
 
 * Windows only.
-* Some apps show download progress only in a notification bubble, never in any
-  window title; those need a trigger they really do publish in a title. (A
-  network-idle mode that watches transfer speed instead is planned.)
+* Some apps show download progress only in a notification bubble, never in
+  any window title; use **⇵ network idle mode** for those (qBittorrent, some
+  Steam builds). Seeding keeps disk reads alive, so with torrents the idle
+  timer effectively waits for seeding to stop too — raise the limit or turn
+  the toggle off if you want the PC down the moment the transfer ends.
 * Windows Store / UWP apps report `ApplicationFrameHost.exe` as their process,
   so process-wide watching and re-attach are less reliable for them.
 * The tool aborts a pending shutdown but cannot stop one whose timer already

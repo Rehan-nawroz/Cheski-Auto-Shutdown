@@ -43,6 +43,10 @@ DEFAULT_TRIGGERS: tuple[str, ...] = SUGGESTED_TRIGGERS
 INTERVAL_RANGE: tuple[float, float] = (0.5, 60.0)
 DWELL_RANGE: tuple[int, int] = (1, 20)
 DELAY_RANGE: tuple[int, int] = (15, 600)
+#: How long a target process must sit at zero activity before network-idle
+#: mode fires.  Generous on purpose: a download that stalls for a minute or
+#: two (tracker wait, disk flush) must not kill the session.
+IDLE_RANGE: tuple[float, float] = (30.0, 1800.0)
 
 
 def _base_dir() -> Path:
@@ -122,6 +126,12 @@ class Settings:
     #: main title never changes, but "Download complete" pops up as its own
     #: window belonging to the same process).
     watch_process_windows: bool = True
+    #: Watch the target process's activity instead of (or alongside) title
+    #: words.  Fires when the process transferred data and then sat at zero
+    #: for ``network_idle_seconds``.  For apps like qBittorrent and Steam that
+    #: never put progress in any window title.
+    network_idle_mode: bool = False
+    network_idle_seconds: float = 300.0
     interval_seconds: float = 2.0
     dwell_checks: int = 3
     shutdown_delay_seconds: int = 60
@@ -155,6 +165,10 @@ class Settings:
         settings.require_transition = _as_bool(raw, "require_transition", settings.require_transition)
         settings.watch_process_windows = _as_bool(
             raw, "watch_process_windows", settings.watch_process_windows
+        )
+        settings.network_idle_mode = _as_bool(raw, "network_idle_mode", settings.network_idle_mode)
+        settings.network_idle_seconds = round(
+            _as_float(raw, "network_idle_seconds", settings.network_idle_seconds, *IDLE_RANGE), 1
         )
         settings.dry_run = _as_bool(raw, "dry_run", settings.dry_run)
         settings.interval_seconds = round(

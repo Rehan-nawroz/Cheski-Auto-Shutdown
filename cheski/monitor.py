@@ -24,6 +24,7 @@ import queue
 import threading
 from dataclasses import dataclass
 
+from .network import ACTIVE, FIRED, WAITING, IdleDetector, ProcessActivitySampler
 from .triggers import TriggerEngine
 from .windows import WindowInfo, WindowSource, resolve_target
 
@@ -75,6 +76,8 @@ class MonitorThread(threading.Thread):
         stop_event: threading.Event | None = None,
         name: str = "cheski-monitor",
         watch_process: bool = True,
+        sampler=None,
+        idle_seconds: float = 300.0,
     ) -> None:
         super().__init__(name=name, daemon=True)
         self.source = source
@@ -85,6 +88,12 @@ class MonitorThread(threading.Thread):
         self.stop_event = stop_event if stop_event is not None else threading.Event()
         self.watch_process = bool(watch_process)
         self.polls = 0
+        # Optional second trigger: process activity instead of title words.
+        # ``sampler`` is anything with ``.sample() -> int | None`` (cumulative
+        # bytes); ``None`` disables the idle path entirely.
+        self._sampler = sampler
+        self._idle = IdleDetector(idle_seconds) if sampler is not None else None
+        self._last_idle_state = None
 
     # -- control ---------------------------------------------------------
 
@@ -197,6 +206,45 @@ class MonitorThread(threading.Thread):
                                 armed=True,
                             )
                             return
+
+                    if self._idle is not None and self.target.pid:
+                        # Second trigger path: the process transferred data and
+                        # has now been quiet for the idle limit.  Only this
+                        # detector's own two-part rule (activity seen, then a
+                        # full quiet period) can fire it; a gone process yields
+                        # ``None`` samples which are ignored, so closing the app
+                        # can never cause a shutdown.
+                        total = self._sampler.sample()
+                        if total is not None:
+                            import time
+
+                            state = self._idle.feed(total, time.monotonic())
+                            if state != self._last_idle_state:
+                                self._last_idle_state = state
+                                self._emit(
+                                    KIND_TICK,
+                                    title=title or "",
+                                    detail={
+                                        WAITING: "network idle: waiting for the app to transfer data",
+                                        ACTIVE: "network idle: app is transferring",
+                                        FIRED: "network idle: transfer finished",
+                                    }.get(state, f"network idle: quiet, fires in {max(0, self._idle.seconds_left(time.monotonic())):.0f}s"),
+                                    armed=True,
+                                )
+                            if state == FIRED:
+                                self._emit(
+                                    KIND_MATCH,
+                                    title=title or "",
+                                    detail=(
+                                        "network idle: {name} transferred data and has been quiet "
+                                        "for {secs:.0f}s"
+                                    ).format(
+                                        name=self.target.process or "the app",
+                                        secs=self._idle.idle_seconds,
+                                    ),
+                                    armed=True,
+                                )
+                                return
                 except Exception as exc:
                     self._emit(
                         KIND_ERROR,
