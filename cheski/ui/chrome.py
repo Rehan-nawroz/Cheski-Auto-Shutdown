@@ -9,9 +9,15 @@ fails (some window managers / remote sessions refuse ``overrideredirect``).
 
 from __future__ import annotations
 
+import ctypes
+import sys
 import tkinter as tk
 
 from . import theme
+
+_GWL_EXSTYLE = -20
+_WS_EX_APPWINDOW = 0x00040000
+_SW_MINIMIZE = 6
 
 
 class WindowChrome:
@@ -22,6 +28,11 @@ class WindowChrome:
         self._drag_offset = None
         self._restore = None
         self.overridden = self._try_override()
+        self._hwnd = self._resolve_hwnd()
+        if self.overridden:
+            # A borderless window has no taskbar button, so an iconified one
+            # could never be brought back.  Give it one.
+            self._enable_taskbar_entry()
 
         self.header = tk.Frame(
             root, bg=theme.SURFACE_CONTAINER_LOW,
@@ -51,7 +62,7 @@ class WindowChrome:
 
         self.controls = tk.Frame(self.header, bg=theme.SURFACE_CONTAINER_LOW)
         self.controls.pack(side="right")
-        self.min_btn = self._control("–", root.iconify)
+        self.min_btn = self._control("–", self._minimize)
         self.max_btn = self._control("□", self._toggle_max)
         self.close_btn = self._control("✕", self._close, danger=True)
 
@@ -99,6 +110,36 @@ class WindowChrome:
 
     # -- behaviours ----------------------------------------------------------
 
+    def _resolve_hwnd(self) -> int | None:
+        """The Win32 wrapper window around Tk's inner window (Windows only)."""
+        if sys.platform != "win32":
+            return None
+        try:
+            self.root.update_idletasks()
+            hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
+            return int(hwnd) or None
+        except Exception:  # pragma: no cover - defensive
+            return None
+
+    def _enable_taskbar_entry(self) -> None:
+        """Add ``WS_EX_APPWINDOW`` so the borderless window gets a taskbar button."""
+        if self._hwnd is None:
+            return
+        user32 = ctypes.windll.user32
+        get_style = getattr(user32, "GetWindowLongPtrW", user32.GetWindowLongW)
+        set_style = getattr(user32, "SetWindowLongPtrW", user32.SetWindowLongW)
+        style = get_style(self._hwnd, _GWL_EXSTYLE)
+        set_style(self._hwnd, _GWL_EXSTYLE, style | _WS_EX_APPWINDOW)
+        # Refresh the mapping so the button shows up immediately.
+        self.root.withdraw()
+        self.root.deiconify()
+
+    def _minimize(self) -> None:
+        if self._hwnd is not None:
+            ctypes.windll.user32.ShowWindow(self._hwnd, _SW_MINIMIZE)
+        else:
+            self.root.iconify()
+
     def _drag_start(self, event):
         self._drag_offset = (event.x_root - self.root.winfo_x(), event.y_root - self.root.winfo_y())
 
@@ -118,10 +159,15 @@ class WindowChrome:
             self._restore = None
 
     def _close(self):
-        self.root.event_generate("<WM_DELETE_WINDOW>")
-        try:
-            self.root.protocol("WM_DELETE_WINDOW")()  # call the registered handler
-        except TypeError:
+        # Run the same handler the native WM_DELETE_WINDOW protocol runs, so a
+        # close through the header behaves exactly like a close through a
+        # native title bar (CheskiApp._on_close aborts a pending shutdown).
+        # event_generate cannot be used: WM_DELETE_WINDOW is a protocol, not
+        # a synthetic-able event.
+        handler = self.root.protocol("WM_DELETE_WINDOW")
+        if handler:
+            self.root.tk.call(handler)
+        else:
             self.root.destroy()
 
 
