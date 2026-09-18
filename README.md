@@ -3,6 +3,10 @@
 Leave the PC downloading overnight; let it power itself off when the download
 finishes.
 
+<p align="center">
+  <img src="assets/screenshot.png" alt="Cheski Auto Shutdown — Terminal Precision UI" width="720">
+</p>
+
 Cheski Auto Shutdown watches the **title bar of the window you pick — and every
 other window owned by the same app**. When a trigger word (`100%`,
 `complete`, …) appears, the PC is shut down after a 60-second countdown you can
