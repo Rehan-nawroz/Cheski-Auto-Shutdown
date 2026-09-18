@@ -217,7 +217,21 @@ class CheskiApp:
         self.delay_card.grid(row=0, column=2, sticky="nsew")
 
         # -- left: dry-run banner ----------------------------------------
+        # -- left: execution mode -----------------------------------------
         self._section_label(left, "Execution mode")
+        scope_row = tk.Frame(left, bg=theme.SURFACE)
+        scope_row.pack(fill="x", pady=(0, 4))
+        self.scope_toggle = GlyphToggle(
+            scope_row, "⤢", value=bool(self.settings.watch_process_windows),
+            on_change=self._on_scope_changed,
+            tooltip="Watch every window of the app, so a completion popup on its own fires the trigger",
+        )
+        self.scope_toggle.pack(side="left")
+        tk.Label(
+            scope_row, text="watch all windows of the app",
+            bg=theme.SURFACE, fg=theme.TEXT_SECONDARY, font=theme.font("body_small"),
+        ).pack(side="left", padx=(8, 0))
+
         self.dry_banner = DryRunBanner(left, value=self._initial_dry_run(),
                                        on_change=self._on_dry_run_changed)
         self.dry_banner.pack(fill="x")
@@ -323,6 +337,10 @@ class CheskiApp:
         self.settings.require_transition = bool(value)
         self._save_preferences_only()
 
+    def _on_scope_changed(self, value: bool) -> None:
+        self.settings.watch_process_windows = bool(value)
+        self._save_preferences_only()
+
     def _on_dry_run_changed(self, value: bool) -> None:
         if self.force_dry_run:
             self.dry_banner.set_value(True)
@@ -425,6 +443,7 @@ class CheskiApp:
             interval=max(0.2, float(self.interval_card.get())),
             events=self.events,
             stop_event=self.stop_event,
+            watch_process=bool(self.settings.watch_process_windows),
         )
         self.worker.start()
         self._show_watched(f"{target.title or '(untitled)'}  [handle {target.handle}]")

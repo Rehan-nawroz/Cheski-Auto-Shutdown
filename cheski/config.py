@@ -117,6 +117,11 @@ class Settings:
     #: before a match is allowed to fire.  Stops an instant shutdown when the
     #: window already reads "100%" (e.g. Steam verifying) as you click Start.
     require_transition: bool = True
+    #: Watch every window of the target's process, not just one.  Catches
+    #: downloaders whose completion popup is a separate window (e.g. IDM: the
+    #: main title never changes, but "Download complete" pops up as its own
+    #: window belonging to the same process).
+    watch_process_windows: bool = True
     interval_seconds: float = 2.0
     dwell_checks: int = 3
     shutdown_delay_seconds: int = 60
@@ -148,6 +153,9 @@ class Settings:
 
         settings.case_sensitive = _as_bool(raw, "case_sensitive", settings.case_sensitive)
         settings.require_transition = _as_bool(raw, "require_transition", settings.require_transition)
+        settings.watch_process_windows = _as_bool(
+            raw, "watch_process_windows", settings.watch_process_windows
+        )
         settings.dry_run = _as_bool(raw, "dry_run", settings.dry_run)
         settings.interval_seconds = round(
             _as_float(raw, "interval_seconds", settings.interval_seconds, *INTERVAL_RANGE), 2

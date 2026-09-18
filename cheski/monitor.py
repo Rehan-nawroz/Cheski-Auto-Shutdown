@@ -9,6 +9,12 @@ Cancellation goes through :class:`threading.Event` with
 instantaneous instead of "up to one interval late".  Poll failures are caught
 and reported as events instead of killing the thread -- a monitor thread that
 dies silently at 3am is worse than one that logs a warning every 2 seconds.
+
+By default the loop watches **every window of the target's process**, not just
+the one window that was picked.  Downloaders like IDM never change their main
+window's title; they pop a separate "Download complete" dialog that did not
+exist when monitoring started.  A single-window watcher can never see it; a
+process-scoped one reads its title the moment it appears.
 """
 
 from __future__ import annotations
@@ -68,6 +74,7 @@ class MonitorThread(threading.Thread):
         events: "queue.Queue[MonitorEvent] | None" = None,
         stop_event: threading.Event | None = None,
         name: str = "cheski-monitor",
+        watch_process: bool = True,
     ) -> None:
         super().__init__(name=name, daemon=True)
         self.source = source
@@ -76,6 +83,7 @@ class MonitorThread(threading.Thread):
         self.interval = max(0.2, float(interval))
         self.events: queue.Queue[MonitorEvent] = events if events is not None else queue.Queue()
         self.stop_event = stop_event if stop_event is not None else threading.Event()
+        self.watch_process = bool(watch_process)
         self.polls = 0
 
     # -- control ---------------------------------------------------------
@@ -90,6 +98,23 @@ class MonitorThread(threading.Thread):
         except Exception as exc:  # pragma: no cover - defensive
             log.debug("Could not post %s event: %s", kind, exc)
 
+    def _process_titles(self) -> str | None:
+        """Union of the titles of every window owned by the target's process.
+
+        ``None`` when process scoping is off or the target has no process name;
+        an empty string when the process is on but currently owns no titled
+        window (the caller then falls back to the single-window read).
+        """
+        if not self.watch_process or not self.target.process:
+            return None
+        wanted = self.target.process.lower()
+        parts = [
+            info.title
+            for info in self.source.list_windows()
+            if info.title and info.process and info.process.lower() == wanted
+        ]
+        return "\n".join(parts) if parts else ""
+
     # -- loop ------------------------------------------------------------
 
     def run(self) -> None:  # noqa: C901 - the loop is deliberately explicit
@@ -102,6 +127,14 @@ class MonitorThread(threading.Thread):
                 try:
                     self.polls += 1
                     title = self.source.get_title(current.handle)
+
+                    scoped = self._process_titles()
+                    if scoped:
+                        # Evaluate the union of the process's window titles.
+                        # This already contains the picked window's own title,
+                        # so it replaces the single-window read outright.
+                        title = scoped
+                        lost_reported = False
 
                     if title is None:
                         # The window is gone.  Never treat this as a trigger;
