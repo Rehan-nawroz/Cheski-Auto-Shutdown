@@ -56,7 +56,7 @@ from ..power import PowerController
 from ..triggers import TriggerConfig, TriggerEngine, parse_triggers
 from ..windows import PyGetWindowSource, WindowInfo, WindowSource
 from . import theme
-from .chrome import WindowChrome, add_resize_grip
+from .chrome import WindowChrome
 from .processes import ProcessRow, build_rows
 from .state import (
     STATE_ABORTED,
@@ -134,7 +134,6 @@ class CheskiApp:
 
         theme.init_theme(root)
         self.chrome = WindowChrome(root, "Cheski Auto Shutdown", __version__)
-        self.grip = add_resize_grip(root)
 
         self._build_ui()
         root.protocol("WM_DELETE_WINDOW", self._on_close)

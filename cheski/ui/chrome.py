@@ -2,9 +2,12 @@
 
 Tk's native title bar cannot be styled, so the app draws its own: a minimal
 header (teal ⬡ logomark, app name, version badge, window controls) over a
-borderless root window.  Edge-dragging moves the window; the bottom-right
-grip resizes it.  ``fallback`` keeps the native title bar when overriding
-fails (some window managers / remote sessions refuse ``overrideredirect``).
+borderless root window.  Edge-dragging moves the window; every window edge
+and corner resizes like a native border (Tk-level bindings — the tiled
+``TkChild`` widget windows swallow Win32-level hit-tests, so the resize lives
+where the input actually flows, in the bindtag chain).  ``fallback`` keeps
+the native title bar when overriding fails (some window managers / remote
+sessions refuse ``overrideredirect``).
 """
 
 from __future__ import annotations
@@ -19,6 +22,39 @@ _GWL_EXSTYLE = -20
 _WS_EX_APPWINDOW = 0x00040000
 _SW_MINIMIZE = 6
 
+#: Thickness in pixels of the draggable resize band along each edge; corners
+#: share both bands so a corner drag resizes two edges at once.
+_RESIZE_BORDER = 6
+
+#: Hard minimum window size for resizing (matches the old grip's floor).
+_MIN_W = 720
+_MIN_H = 560
+
+if sys.platform == "win32":
+    # Prototyped once: pointer-sized values do not fit ctypes' default ints.
+    _user32 = ctypes.WinDLL("user32")
+    _user32.GetParent.restype = ctypes.c_void_p
+    _user32.GetParent.argtypes = (ctypes.c_void_p,)
+    _user32.ShowWindow.argtypes = (ctypes.c_void_p, ctypes.c_int)
+    if hasattr(_user32, "GetWindowLongPtrW"):
+        _get_window_long = _user32.GetWindowLongPtrW
+        _set_window_long = _user32.SetWindowLongPtrW
+    else:  # 32-bit Python: the PtrW exports do not exist there
+        _get_window_long = _user32.GetWindowLongW
+        _set_window_long = _user32.SetWindowLongW
+    _get_window_long.restype = ctypes.c_ssize_t
+    _get_window_long.argtypes = (ctypes.c_void_p, ctypes.c_int)
+    _set_window_long.restype = ctypes.c_ssize_t
+    _set_window_long.argtypes = (ctypes.c_void_p, ctypes.c_int, ctypes.c_ssize_t)
+else:  # pragma: no cover - non-Windows development
+    _user32 = None
+
+    def _get_window_long(*_a):
+        return 0
+
+    def _set_window_long(*_a):
+        return 0
+
 
 class WindowChrome:
     """Attaches a custom header to a root window and hides the native one."""
@@ -29,10 +65,14 @@ class WindowChrome:
         self._restore = None
         self.overridden = self._try_override()
         self._hwnd = self._resolve_hwnd()
+        # Tk-level resize state; see _install_resize_edges.
+        self._resize: tuple | None = None
+        self._cursor_zone: str | None = None
         if self.overridden:
             # A borderless window has no taskbar button, so an iconified one
             # could never be brought back.  Give it one.
             self._enable_taskbar_entry()
+            self._install_resize_edges()
 
         self.header = tk.Frame(
             root, bg=theme.SURFACE_CONTAINER_LOW,
@@ -112,11 +152,11 @@ class WindowChrome:
 
     def _resolve_hwnd(self) -> int | None:
         """The Win32 wrapper window around Tk's inner window (Windows only)."""
-        if sys.platform != "win32":
+        if _user32 is None:
             return None
         try:
             self.root.update_idletasks()
-            hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
+            hwnd = _user32.GetParent(self.root.winfo_id())
             return int(hwnd) or None
         except Exception:  # pragma: no cover - defensive
             return None
@@ -125,22 +165,123 @@ class WindowChrome:
         """Add ``WS_EX_APPWINDOW`` so the borderless window gets a taskbar button."""
         if self._hwnd is None:
             return
-        user32 = ctypes.windll.user32
-        get_style = getattr(user32, "GetWindowLongPtrW", user32.GetWindowLongW)
-        set_style = getattr(user32, "SetWindowLongPtrW", user32.SetWindowLongW)
-        style = get_style(self._hwnd, _GWL_EXSTYLE)
-        set_style(self._hwnd, _GWL_EXSTYLE, style | _WS_EX_APPWINDOW)
+        style = _get_window_long(self._hwnd, _GWL_EXSTYLE)
+        _set_window_long(self._hwnd, _GWL_EXSTYLE, style | _WS_EX_APPWINDOW)
         # Refresh the mapping so the button shows up immediately.
         self.root.withdraw()
         self.root.deiconify()
 
+    # -- Tk-level edge resize ------------------------------------------------
+    #
+    # Tk tiles its client area with per-widget child HWNDs, so a Win32
+    # WM_NCHITTEST subclass on any single window never sees clicks near the
+    # edges.  The bindtag chain does: every widget's event propagates to the
+    # toplevel binding unless a widget breaks, so binding on the root window
+    # sees presses at every edge exactly the way the header drag does.
+
+    def _install_resize_edges(self) -> None:
+        root = self.root
+        root.bind("<ButtonPress-1>", self._resize_press, add="+")
+        root.bind("<B1-Motion>", self._resize_motion, add="+")
+        root.bind("<ButtonRelease-1>", self._resize_release, add="+")
+        root.bind("<Motion>", self._resize_hover, add="+")
+        root.bind("<Leave>", self._resize_leave, add="+")
+
+    def _zone_at(self, x: int, y: int) -> str | None:
+        """Edge zone (``n``/``s``/``e``/``w`` combined) at screen point, if any."""
+        rx, ry = self.root.winfo_rootx(), self.root.winfo_rooty()
+        w, h = self.root.winfo_width(), self.root.winfo_height()
+        b = _RESIZE_BORDER
+        top = y - ry <= b
+        bottom = ry + h - y <= b
+        left = x - rx <= b
+        right = rx + w - x <= b
+        zone = ""
+        if top:
+            zone += "n"
+        elif bottom:
+            zone += "s"
+        if left:
+            zone += "w"
+        elif right:
+            zone += "e"
+        return zone or None
+
+    _ZONE_CURSORS = {
+        "n": "sb_v_double_arrow", "s": "sb_v_double_arrow",
+        "e": "sb_h_double_arrow", "w": "sb_h_double_arrow",
+        "nw": "size_nw_se", "se": "size_nw_se",
+        "ne": "size_ne_sw", "sw": "size_ne_sw",
+    }
+
+    def _resize_press(self, event) -> None:
+        zone = self._zone_at(event.x_root, event.y_root)
+        if zone is None:
+            return
+        self._resize = (
+            zone,
+            self.root.winfo_width(), self.root.winfo_height(),
+            self.root.winfo_rootx(), self.root.winfo_rooty(),
+            event.x_root, event.y_root,
+        )
+
+    def _resize_motion(self, event) -> None:
+        if self._resize is None:
+            return
+        zone, sw, sh, sx, sy, px, py = self._resize
+        dx, dy = event.x_root - px, event.y_root - py
+        w, h, x, y = sw, sh, sx, sy
+        if "e" in zone:
+            w = sw + dx
+        if "w" in zone:
+            w = sw - dx
+            x = sx + dx
+        if "s" in zone:
+            h = sh + dy
+        if "n" in zone:
+            h = sh - dy
+            y = sy + dy
+        w = max(_MIN_W, w)
+        h = max(_MIN_H, h)
+        # When clamped, keep the opposite edge fixed instead of drifting.
+        if "w" in zone and w == _MIN_W:
+            x = sx
+        if "n" in zone and h == _MIN_H:
+            y = sy
+        self.root.geometry(f"{w}x{h}+{x}+{y}")
+
+    def _resize_release(self, _event) -> None:
+        self._resize = None
+        self._set_zone_cursor(None)
+
+    def _resize_hover(self, event) -> None:
+        if self._resize is not None:
+            return  # keep the active shape while dragging
+        self._set_zone_cursor(self._zone_at(event.x_root, event.y_root))
+
+    def _resize_leave(self, _event) -> None:
+        if self._resize is None:
+            self._set_zone_cursor(None)
+
+    def _set_zone_cursor(self, zone: str | None) -> None:
+        if zone == self._cursor_zone:
+            return
+        self._cursor_zone = zone
+        self.root.configure(cursor=self._ZONE_CURSORS.get(zone, ""))
+
+    # -- header controls -----------------------------------------------------
+
     def _minimize(self) -> None:
         if self._hwnd is not None:
-            ctypes.windll.user32.ShowWindow(self._hwnd, _SW_MINIMIZE)
+            _user32.ShowWindow(self._hwnd, _SW_MINIMIZE)
         else:
             self.root.iconify()
 
     def _drag_start(self, event):
+        # The top resize band owns the first few pixels; don't fight it.
+        if event.y_root - self.root.winfo_rooty() <= _RESIZE_BORDER:
+            self._drag_offset = None
+            return
         self._drag_offset = (event.x_root - self.root.winfo_x(), event.y_root - self.root.winfo_y())
 
     def _drag_move(self, event):
@@ -173,28 +314,3 @@ class WindowChrome:
 
 def with_alpha_badge() -> str:
     return theme.with_alpha(theme.PRIMARY_CONTAINER, 0.14)
-
-
-def add_resize_grip(root: tk.Tk) -> tk.Canvas | None:
-    """Bottom-right drag grip for the borderless window (None if native)."""
-    if not root.overrideredirect():
-        return None
-    grip = tk.Canvas(root, width=16, height=16, bg=theme.SURFACE,
-                     highlightthickness=0, cursor="size_nw_se")
-    grip.place(relx=1.0, rely=1.0, anchor="se")
-    grip.create_polygon(16, 6, 16, 16, 6, 16, fill=theme.SURFACE_CONTAINER_HIGHEST)
-    grip.create_polygon(16, 11, 16, 16, 11, 16, fill=theme.TEXT_MUTED)
-    state = {"start": None}
-
-    def press(event):
-        state["start"] = (root.winfo_width(), root.winfo_height(), event.x_root, event.y_root)
-
-    def move(event):
-        if state["start"] is None:
-            return
-        w0, h0, x0, y0 = state["start"]
-        root.geometry(f"{max(720, w0 + event.x_root - x0)}x{max(560, h0 + event.y_root - y0)}")
-
-    grip.bind("<ButtonPress-1>", press)
-    grip.bind("<B1-Motion>", move)
-    return grip
