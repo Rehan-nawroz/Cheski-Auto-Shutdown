@@ -3,19 +3,31 @@
 Leave the PC downloading overnight; let it power itself off when the download
 finishes.
 
-Cheski Auto Shutdown watches the **title bar** of a window you choose. When a
-trigger word (``100%``, ``Complete``, …) appears in it, the PC is shut down
-after a cancellable countdown. No AI, no screenshots, no CPU load — reading a
-title bar is a few microseconds of work.
+Cheski Auto Shutdown watches the **title bar of the window you pick — and every
+other window owned by the same app**. When a trigger word (`100%`,
+`complete`, …) appears, the PC is shut down after a 60-second countdown you can
+abort. No AI, no screenshots, no CPU load — reading a title bar is a few
+microseconds of work.
 
-Full plans and design notes live in [`docs/`](docs/README.md).
+## Why process-wide watching matters
+
+Some downloaders never put progress in their main window's title. IDM is the
+classic case: its title stays `Internet Download Manager 6.43` forever, and the
+`Download complete` message appears in a **separate popup window** that did not
+exist when you pressed Start. A watcher locked to one window can never see it.
+
+Cheski therefore reads the **union of every window title owned by the target's
+process** on each check. When that popup appears, it belongs to the same
+process as your target, so its title is seen the instant it pops. You can turn
+this off with the **⤢ watch all windows of the app** toggle if you want the
+old exact-window behavior.
 
 ## Requirements
 
 * Windows (the tool drives `shutdown.exe`)
 * Python 3.11+ with tkinter (bundled with the python.org and Microsoft Store
   installers)
-* `pygetwindow`
+* `pygetwindow` and `psutil` (installed by the requirements file)
 
 ```
 python -m pip install -r requirements.txt
@@ -23,41 +35,73 @@ python -m pip install -r requirements.txt
 
 ## Quickstart
 
-1. Start the download (Steam, Epic, Chrome, qBittorrent, …).
+1. Start the download (Steam, Epic, IDM, Chrome, qBittorrent, …).
 2. Launch Cheski — double-click `run_cheski.bat`, or:
 
    ```
    python -m cheski
    ```
 
-3. Press **Refresh list** and pick the downloading app.
-4. Leave the trigger words as `100%` or type your own.
-5. Tick **Dry run** the first time. Press **Start monitoring** and watch the
-   Status box.
-6. When you are happy, untick **Dry run** and leave it running.
+3. In **Window to watch**, find the app in the process list (the search box
+   filters by name) and click it.
+4. Leave the **trigger words** as they are — the six suggested words
+   (`100%`, `complete`, `finished`, `done`, `downloaded`, `seeding`) already
+   cover IDM's `Download complete` and almost every downloader's finish text.
+   Matching is a case-insensitive substring test: `complete` matches both
+   `Download complete` and `completed`.
+5. Your first launch starts in **Dry run mode** (badge says SAFE): the
+   shutdown command is logged, not executed. Press **Start monitoring** and
+   watch the log.
+6. When you have seen a full run, flip the banner to **LIVE** and leave it
+   running. From now on a real countdown starts when the trigger appears.
 
-The Status box shows one of:
+### How the tool decides to fire
+
+* Every `Check interval` seconds (default 0.5–2) it reads the titles.
+* A trigger word must be present for `Confirm passes` consecutive checks
+  (default 3) before firing — a title that flashes past in one poll is
+  ignored on purpose.
+* **The trigger must clear once after Start before a match counts.** If the
+  title already says `100%` when you press Start, Cheski sits in *Arming*
+  and refuses to fire until it sees the trigger disappear and come back.
+  This is what makes an accidental Start harmless.
+
+## The interface
+
+| Control | What it does |
+| --- | --- |
+| **Process picker** | Searchable list of running apps with icon, process name, PID and memory. The ⟳ button rescans. |
+| **Trigger words** | Chips. Type and press Enter to add; ✕ on a chip removes it. The `suggested:` row adds missing words with one click. The ANY/ALL switch picks whether one word is enough or every word must appear; the `Aa` button toggles case sensitivity. |
+| **Check interval / Confirm passes / Grace period** | The three timing cards. Grace period is the abort window in seconds (15–600, default 60); it pulses amber below 30. |
+| **Dry run mode banner** | SAFE (teal) logs the command; LIVE (amber) really schedules it. |
+| **Status ring** | Idle / Active / Confirmed / Executing, with the watched window, its last title, and a big red `mm:ss` countdown when a shutdown is pending. |
+| **⬡ Abort shutdown** | The red pill. Cancels the pending Windows shutdown immediately (`shutdown /a`). |
+| **Event log** | Timestamped record of every poll event, with copy-all and auto-scroll lock. |
+
+The **⤢ watch all windows of the app** toggle above the dry-run banner keeps
+the process-wide watching described above on (default) or off.
+
+## Status meanings
 
 | Status | Meaning |
 | --- | --- |
-| Arming | The trigger is already in the title bar. Cheski refuses to fire until it sees the trigger disappear once. |
+| Idle | Not monitoring. |
+| Arming | The trigger is already visible. Cheski refuses to fire until it clears once. |
 | Monitoring | Armed and watching. |
-| TRIGGERED | A shutdown has been scheduled; the countdown window is up. |
+| TRIGGERED | A shutdown has been scheduled; the red countdown is running. |
 | Shutdown aborted | Nothing is scheduled. |
 
 ## Safety notes
 
-* **Windows force-closes apps at zero.** `shutdown /s /t 60` implies the `/f`
-  flag whenever the timer is greater than zero, so save your work if you are
-  still at the PC. Cheski says so in the countdown window.
-* **The trigger has to clear once before it can fire.** Starting Cheski while
-  the title bar already reads `100%` will not shut the PC down; it waits for
-  the trigger to disappear and come back. This is what makes an accidental
-  click on Start harmless.
-* **Dry run** logs the exact command instead of running it. It is on for the
-  first launch, and can be forced with `--dry-run` or `CHESKI_DRY_RUN=1`.
-* **Closing the window during the countdown cancels the pending shutdown**,
-  rather than leaving a scheduled shutdown you cannot see.
+* **Windows force-closes apps at zero.** `shutdown /s /t 60` implies `/f`
+  whenever the timer is above zero, so save your work if you are still at the
+  PC. Cheski says so in the countdown.
+* **Abort is always available** during the countdown — the red pill, or
+  `shutdown /a` from any terminal.
+* **Closing the Cheski window during a countdown cancels the pending
+  shutdown**, rather than leaving a scheduled shutdown you cannot see.
+* A vanished window never fires. If the target disappears, Cheski waits for
+  it (or re-attaches to a new window of the same process) and keeps watching.
 * Closing Cheski never kills your download; it only stops watching.
 
 ## Command line
@@ -68,42 +112,23 @@ python -m cheski [--dry-run] [--trigger WORD] [--seconds 60] [--interval 2]
 
 | Flag | Effect |
 | --- | --- |
-| `--dry-run` | Log the command instead of executing it; locks the checkbox on. |
+| `--dry-run` | Log the command instead of executing it; locks the banner on SAFE. |
 | `--trigger` | Trigger word. Repeat the flag or pass a comma-separated list. |
 | `--seconds` | Countdown length, 15–600 (default 60). |
 | `--interval` | Seconds between title checks, 0.5–60 (default 2). |
 | `--log-level` | `DEBUG`, `INFO`, `WARNING`, `ERROR`. |
 
-Settings are remembered in `%APPDATA%\CheskiAutoShutdown\config.json`, and every
-run is appended to `%APPDATA%\CheskiAutoShutdown\logs\cheski.log` so an
+Settings are remembered in `%APPDATA%\CheskiAutoShutdown\config.json`, and
+every run is appended to `%APPDATA%\CheskiAutoShutdown\logs\cheski.log` so an
 unattended night can be checked afterwards.
-
-## Testing
-
-```
-python -m pip install -r requirements-dev.txt
-python -m pytest
-```
-
-The suite never touches the real `shutdown.exe`: tests inject a recording
-command runner, and an autouse guard fails any test that tries to launch it.
-
-For a hands-on end-to-end run, start the fake downloader in
-[`tests/manual/title_simulator.py`](tests/manual/title_simulator.py) — it is a
-window that does nothing but change its own title bar, so the whole flow can be
-tested in seconds instead of hours.
-
-`python tests/manual/live_probe.py` is a scripted version of the same idea
-against the real desktop: it opens a real window, watches its real title bar and
-verifies both that a genuine `100%` fires and that an already-finished title
-does not. It never imports the power layer, so nothing can be shut down.
 
 ## Known limitations
 
 * Windows only.
+* Some apps show download progress only in a notification bubble, never in any
+  window title; those need a trigger they really do publish in a title. (A
+  network-idle mode that watches transfer speed instead is planned.)
 * Windows Store / UWP apps report `ApplicationFrameHost.exe` as their process,
-  so automatic re-attach after a window is recreated is less reliable for them.
-* Some apps (notably browsers) show download progress in a bubble instead of
-  the title bar; those need a trigger that they really do put in the title.
-* The tool shuts the PC down but cannot stop a shutdown that has already run
-  out its timer.
+  so process-wide watching and re-attach are less reliable for them.
+* The tool aborts a pending shutdown but cannot stop one whose timer already
+  ran out.
