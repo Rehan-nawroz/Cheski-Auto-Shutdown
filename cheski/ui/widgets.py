@@ -21,7 +21,6 @@ thread, or know about shutdown semantics.  ``app.py`` does the wiring.
 
 from __future__ import annotations
 
-import queue
 import time
 import tkinter as tk
 from tkinter import font as tkfont
@@ -34,6 +33,12 @@ from .theme import blend, with_alpha
 
 def _mono(size: int, weight: str = "normal") -> tuple:
     return (theme.mono_family(), size, weight)
+
+
+# Picker row surfaces: idle background and the selection tint.
+ROW_BG = theme.SURFACE_LOWEST
+#: Pre-composited over the surface — Tk has no alpha.
+SELECTED_BG = with_alpha(theme.PRIMARY_CONTAINER, 0.16)
 
 
 # ---------------------------------------------------------------------------
@@ -109,6 +114,7 @@ class ProcessPicker(tk.Frame):
         self.canvas.bind("<Configure>", self._on_canvas_configure)
         self.canvas.bind_all("<MouseWheel>", self._on_mousewheel, add="+")
         self.row_frames: list[tk.Frame] = []
+        self._row_surfaces: dict[ProcessRow, tuple[tk.Widget, ...]] = {}
         self._make_scanning_label()
         self._scanning = False
 
@@ -128,6 +134,7 @@ class ProcessPicker(tk.Frame):
                 if child is not self.scanning_label:
                     child.destroy()
             self.row_frames = []
+            self._row_surfaces = {}
             if not self.scanning_label.winfo_exists():
                 self._make_scanning_label()
             self.scanning_label.configure(text="● scanning")
@@ -155,6 +162,11 @@ class ProcessPicker(tk.Frame):
     def selected_row(self) -> ProcessRow | None:
         return self._selected
 
+    def row_frame(self, row: ProcessRow) -> tk.Frame | None:
+        """The frame currently showing ``row`` (None once filtered out)."""
+        surfaces = self._row_surfaces.get(row)
+        return surfaces[0] if surfaces else None
+
     def select_row(self, row: ProcessRow) -> None:
         """Programmatic selection (same path a click takes, minus the event)."""
         if row not in self._rows:
@@ -181,55 +193,53 @@ class ProcessPicker(tk.Frame):
             if child is not self.scanning_label:
                 child.destroy()
         self.row_frames = []
+        self._row_surfaces = {}
         for i, row in enumerate(self._visible_rows()):
             frame = self._build_row(row, i)
             self.row_frames.append(frame)
             if fade:
-                frame.configure(bg=with_alpha(theme.PRIMARY_CONTAINER, 0.12))
-                self._fade_in(frame, 0)
+                self._fade_in(row, 0)
         self._highlight()
         self.inner.update_idletasks()
         self.canvas.configure(scrollregion=self.canvas.bbox("all"))
 
-    def _fade_in(self, frame, step):
-        if not frame.winfo_exists():
-            return
+    def _fade_in(self, row: ProcessRow, step: int):
+        if row is self._selected or row not in self._row_surfaces:
+            return  # a selected row keeps its highlight instead of fading
         t = step / 6
-        colour = blend(with_alpha(theme.PRIMARY_CONTAINER, 0.12), theme.SURFACE_LOWEST, t)
-        try:
-            frame.configure(bg=colour)
-        except tk.TclError:
-            return
+        colour = blend(with_alpha(theme.PRIMARY_CONTAINER, 0.12), ROW_BG, t)
+        self._paint_row(row, colour)
         if step < 6:
-            self._fade_job = self.after(self.FADE_MS // 6, lambda: self._fade_in(frame, step + 1))
+            self._fade_job = self.after(self.FADE_MS // 6, lambda: self._fade_in(row, step + 1))
 
     def _build_row(self, row: ProcessRow, index: int) -> tk.Frame:
-        frame = tk.Frame(self.inner, bg=theme.SURFACE_LOWEST)
+        frame = tk.Frame(self.inner, bg=ROW_BG)
         frame.pack(fill="x")
         icon_canvas = tk.Canvas(
-            frame, width=28, height=28, bg=theme.SURFACE_LOWEST,
+            frame, width=28, height=28, bg=ROW_BG,
             highlightthickness=0,
         )
         icon_canvas.pack(side="left", padx=(10, 8), pady=8)
         self._draw_icon(icon_canvas, row)
-        text_col = tk.Frame(frame, bg=theme.SURFACE_LOWEST)
+        text_col = tk.Frame(frame, bg=ROW_BG)
         text_col.pack(side="left", fill="x", expand=True, pady=6)
         name_label = tk.Label(
-            text_col, text=row.display_name, bg=theme.SURFACE_LOWEST,
+            text_col, text=row.display_name, bg=ROW_BG,
             fg=theme.TEXT_HIGH, font=theme.font("body"), anchor="w",
         )
         name_label.pack(anchor="w")
         meta = f"{row.process or 'unknown'} · pid {row.pid or '?'} · {row.memory_text}"
         meta_label = tk.Label(
-            text_col, text=meta, bg=theme.SURFACE_LOWEST,
+            text_col, text=meta, bg=ROW_BG,
             fg=theme.TEXT_SECONDARY, font=_mono(8), anchor="w",
         )
         meta_label.pack(anchor="w")
         for widget in (frame, icon_canvas, text_col, name_label, meta_label):
             widget.bind("<Double-Button-1>", lambda _e, r=row: self._choose(r))
-            widget.bind("<Button-1>", lambda _e, r=row, f=frame: self._preview(r, f))
+            widget.bind("<Button-1>", lambda _e, r=row: self._preview(r))
         if index % 2 == 1:
             tk.Frame(frame, bg=theme.BORDER, height=1).pack(fill="x", side="bottom")
+        self._row_surfaces[row] = (frame, icon_canvas, text_col, name_label, meta_label)
         return frame
 
     def _draw_icon(self, canvas: tk.Canvas, row: ProcessRow):
@@ -240,7 +250,6 @@ class ProcessPicker(tk.Frame):
             image = None
         if image is None:
             image = fallback_avatar(row.process)
-        photo = tk.PhotoImage(getattr(image, "tk", image)) if False else None
         try:
             from PIL import ImageTk
 
@@ -256,7 +265,7 @@ class ProcessPicker(tk.Frame):
                 fill=theme.PRIMARY, font=_mono(11, "bold"),
             )
 
-    def _preview(self, row, frame):
+    def _preview(self, row):
         self._selected = row
         self._highlight()
 
@@ -265,14 +274,16 @@ class ProcessPicker(tk.Frame):
         self._highlight()
         self.on_select(row)
 
+    def _paint_row(self, row: ProcessRow, bg: str) -> None:
+        """Paint one row and every surface inside it."""
+        for widget in self._row_surfaces.get(row, ()):
+            if widget.winfo_exists():
+                widget.configure(bg=bg)
+
     def _highlight(self):
-        for frame in self.row_frames:
-            if frame.winfo_exists():
-                frame.configure(
-                    bg=with_alpha(theme.PRIMARY_CONTAINER, 0.16)
-                    if self._selected is not None and frame in getattr(self, "_frame_of", {}).get(self._selected, [])
-                    else theme.SURFACE_LOWEST
-                )
+        """Re-paint the rows so exactly the selected one reads as selected."""
+        for row in self._row_surfaces:
+            self._paint_row(row, SELECTED_BG if row is self._selected else ROW_BG)
 
     def _pulse_refresh(self):
         self.refresh_button.delete("all")
@@ -286,15 +297,6 @@ class ProcessPicker(tk.Frame):
         c.create_arc(8, 8, 22, 22, start=20 + 120 * spun, extent=250,
                      style="arc", outline=colour, width=2)
         c.create_polygon(21, 6, 25, 12, 18, 12, fill=colour, outline=colour)
-
-    def _pulse_scanning(self):
-        if not self._scanning:
-            return
-        current = int(self.scanning_label.cget("text").strip("● ").count("…") * 0)  # no-op
-        text = self.scanning_label.cget("text")
-        dots = (text.count("·") + 1) % 4
-        self.scanning_label.configure(text="● scanning" + " ·" * dots)
-        self._scan_job = self.after(320, self._pulse_scanning)
 
     def _stop_scanning_pulse(self):
         job = getattr(self, "_scan_job", None)
@@ -312,8 +314,7 @@ class ProcessPicker(tk.Frame):
         self.canvas.itemconfigure(self._inner_window, width=event.width)
 
     def _on_mousewheel(self, event):
-        if self.winfo_containing(event.x_root, event.y_root) is self.canvas or True:
-            self.canvas.yview_scroll(-int(event.delta / 120), "units")
+        self.canvas.yview_scroll(-int(event.delta / 120), "units")
 
     def _show_placeholder(self, _event=None):
         if not self.search_entry.get():

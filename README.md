@@ -7,6 +7,10 @@ finishes.
   <img src="assets/screenshot.png" alt="Cheski Auto Shutdown — Terminal Precision UI" width="720">
 </p>
 
+<p align="center">
+  <img src="assets/Screenshot-2.png" alt="Cheski Auto Shutdown right after launch — status ring idle, process list with search ready to pick a window, empty event log" width="720">
+</p>
+
 Cheski Auto Shutdown watches the **title bar of the window you pick — and every
 other window owned by the same app**. When a trigger word (`100%`,
 `complete`, …) appears, the PC is shut down after a 60-second countdown you can
